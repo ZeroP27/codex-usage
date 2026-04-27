@@ -5,6 +5,8 @@ MODE="${1:-run}"
 APP_DISPLAY_NAME="Codex Usage"
 EXECUTABLE_NAME="CodexUsageMonitor"
 BUNDLE_ID="dev.idea-space.CodexUsageMonitor"
+AUTHOR_NAME="ZeroP27"
+COPYRIGHT="Copyright (c) 2026 $AUTHOR_NAME"
 MIN_SYSTEM_VERSION="14.0"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -50,6 +52,8 @@ cat >"$INFO_PLIST" <<PLIST
   <string>APPL</string>
   <key>LSMinimumSystemVersion</key>
   <string>$MIN_SYSTEM_VERSION</string>
+  <key>NSHumanReadableCopyright</key>
+  <string>$COPYRIGHT</string>
   <key>LSUIElement</key>
   <true/>
   <key>NSPrincipalClass</key>

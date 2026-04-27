@@ -14,6 +14,18 @@ through JSON-RPC.
 
 The monitor does not read browser cookies or legacy local usage databases.
 
+## Privacy
+
+Codex Usage reads Codex credentials only from `~/.codex/auth.json` or
+`$CODEX_HOME/auth.json`. Those tokens are used to call ChatGPT/OpenAI usage and
+OAuth refresh endpoints, and refreshed tokens are written back to the same
+local auth file with owner-only permissions.
+
+The app stores only local preferences in macOS UserDefaults: data source,
+refresh interval, and optional Codex executable path. It does not include
+analytics, telemetry, crash reporting, browser-cookie access, prompt-history
+access, or third-party data collection.
+
 ## Run
 
 ```bash
@@ -67,6 +79,8 @@ To build a single architecture package:
 ZeroP27
 
 GitHub: https://github.com/ZeroP27
+
+Repository: https://github.com/ZeroP27/codex-usage
 
 ## License
 
