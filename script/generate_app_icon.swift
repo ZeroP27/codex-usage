@@ -12,7 +12,9 @@ guard outputURL.pathExtension == "iconset" else {
     exit(2)
 }
 
-try? FileManager.default.removeItem(at: outputURL)
+if FileManager.default.fileExists(atPath: outputURL.path) {
+    try FileManager.default.removeItem(at: outputURL)
+}
 try FileManager.default.createDirectory(at: outputURL, withIntermediateDirectories: true)
 
 let iconFiles: [(String, Int)] = [

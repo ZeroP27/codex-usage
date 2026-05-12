@@ -10,6 +10,7 @@ COPYRIGHT="Copyright (c) 2026 $AUTHOR_NAME"
 MIN_SYSTEM_VERSION="14.0"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SWIFT_SCRIPT_MODULE_CACHE="$ROOT_DIR/.build/module-cache"
 DIST_DIR="$ROOT_DIR/dist"
 APP_BUNDLE="$DIST_DIR/$APP_DISPLAY_NAME.app"
 APP_CONTENTS="$APP_BUNDLE/Contents"
@@ -20,7 +21,9 @@ INFO_PLIST="$APP_CONTENTS/Info.plist"
 ICONSET="$DIST_DIR/AppIcon.iconset"
 ICON_ICNS="$APP_RESOURCES/AppIcon.icns"
 
-pkill -x "$EXECUTABLE_NAME" >/dev/null 2>&1 || true
+if [[ "$MODE" != "--bundle" && "$MODE" != "bundle" ]]; then
+  pkill -x "$EXECUTABLE_NAME" >/dev/null 2>&1 || true
+fi
 
 swift build
 BUILD_BINARY="$(swift build --show-bin-path)/$EXECUTABLE_NAME"
@@ -29,9 +32,8 @@ mkdir -p "$APP_MACOS" "$APP_RESOURCES"
 cp "$BUILD_BINARY" "$APP_BINARY"
 chmod +x "$APP_BINARY"
 
-swift "$ROOT_DIR/script/generate_app_icon.swift" "$ICONSET"
+env CLANG_MODULE_CACHE_PATH="$SWIFT_SCRIPT_MODULE_CACHE" swift "$ROOT_DIR/script/generate_app_icon.swift" "$ICONSET"
 /usr/bin/iconutil -c icns "$ICONSET" -o "$ICON_ICNS"
-rm -rf "$ICONSET"
 
 cat >"$INFO_PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -67,6 +69,9 @@ open_app() {
 }
 
 case "$MODE" in
+  --bundle|bundle)
+    echo "App bundle ready: $APP_BUNDLE"
+    ;;
   run)
     open_app
     ;;
@@ -87,7 +92,7 @@ case "$MODE" in
     pgrep -x "$EXECUTABLE_NAME" >/dev/null
     ;;
   *)
-    echo "usage: $0 [run|--debug|--logs|--telemetry|--verify]" >&2
+    echo "usage: $0 [run|--bundle|--debug|--logs|--telemetry|--verify]" >&2
     exit 2
     ;;
 esac

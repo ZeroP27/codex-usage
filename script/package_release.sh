@@ -9,6 +9,7 @@ COPYRIGHT="Copyright (c) 2026 $AUTHOR_NAME"
 MIN_SYSTEM_VERSION="14.0"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SWIFT_SCRIPT_MODULE_CACHE="$ROOT_DIR/.build/module-cache"
 DIST_DIR="$ROOT_DIR/dist/release"
 APP_BUNDLE="$DIST_DIR/$APP_DISPLAY_NAME.app"
 APP_CONTENTS="$APP_BUNDLE/Contents"
@@ -63,6 +64,12 @@ fail() {
 
 require_command() {
   command -v "$1" >/dev/null 2>&1 || fail "missing required command: $1"
+}
+
+delete_path_if_exists() {
+  local path="$1"
+  [[ -e "$path" ]] || return 0
+  env CLANG_MODULE_CACHE_PATH="$SWIFT_SCRIPT_MODULE_CACHE" swift -e 'import Foundation; try FileManager.default.removeItem(atPath: CommandLine.arguments[1])' "$path"
 }
 
 while (($#)); do
@@ -154,44 +161,50 @@ FINAL_ARCHIVE="$DIST_DIR/$ARCHIVE_BASENAME-$ARCH.zip"
 NOTARY_ARCHIVE="$DIST_DIR/$ARCHIVE_BASENAME-notary.zip"
 
 build_host_binary() {
+  local result_var="$1"
   echo "Building release binary for host architecture..." >&2
   swift build -c release --manifest-cache local >&2
   local bin_path
-  bin_path="$(swift build -c release --manifest-cache local --show-bin-path)"
+  bin_path="$(swift build -c release --manifest-cache local --show-bin-path)" || return
   local binary="$bin_path/$EXECUTABLE_NAME"
   [[ -x "$binary" ]] || fail "release binary not found: $binary"
-  printf '%s\n' "$binary"
+  printf -v "$result_var" '%s' "$binary"
 }
 
 build_arch_binary() {
   local arch="$1"
+  local result_var="$2"
   local triple="$arch-apple-macosx$MIN_SYSTEM_VERSION"
 
   echo "Building release binary for $arch..." >&2
   swift build -c release --triple "$triple" --manifest-cache local >&2
 
   local bin_path
-  bin_path="$(swift build -c release --triple "$triple" --manifest-cache local --show-bin-path)"
+  bin_path="$(swift build -c release --triple "$triple" --manifest-cache local --show-bin-path)" || return
   local binary="$bin_path/$EXECUTABLE_NAME"
   [[ -x "$binary" ]] || fail "release binary not found: $binary"
-  printf '%s\n' "$binary"
+  printf -v "$result_var" '%s' "$binary"
 }
 
 case "$ARCH" in
   universal)
-    ARM_BINARY="$(build_arch_binary arm64)"
-    X86_BINARY="$(build_arch_binary x86_64)"
+    ARM_BINARY=""
+    X86_BINARY=""
+    build_arch_binary arm64 ARM_BINARY
+    build_arch_binary x86_64 X86_BINARY
     ;;
   arm64|x86_64)
-    BUILD_BINARY="$(build_arch_binary "$ARCH")"
+    BUILD_BINARY=""
+    build_arch_binary "$ARCH" BUILD_BINARY
     ;;
   host)
-    BUILD_BINARY="$(build_host_binary)"
+    BUILD_BINARY=""
+    build_host_binary BUILD_BINARY
     ;;
 esac
 
 echo "Assembling app bundle..."
-rm -rf "$DIST_DIR"
+delete_path_if_exists "$DIST_DIR"
 mkdir -p "$APP_MACOS" "$APP_RESOURCES"
 
 case "$ARCH" in
@@ -205,9 +218,9 @@ esac
 
 chmod +x "$APP_BINARY"
 
-swift "$ROOT_DIR/script/generate_app_icon.swift" "$ICONSET"
+env CLANG_MODULE_CACHE_PATH="$SWIFT_SCRIPT_MODULE_CACHE" swift "$ROOT_DIR/script/generate_app_icon.swift" "$ICONSET"
 /usr/bin/iconutil -c icns "$ICONSET" -o "$ICON_ICNS"
-rm -rf "$ICONSET"
+delete_path_if_exists "$ICONSET"
 
 cat >"$INFO_PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -259,7 +272,7 @@ if [[ "$SIGNING_MODE" == "signed" ]]; then
     echo "Stapling notarization ticket..."
     xcrun stapler staple "$APP_BUNDLE"
     /usr/sbin/spctl --assess --type execute --verbose "$APP_BUNDLE"
-    rm -f "$NOTARY_ARCHIVE"
+    delete_path_if_exists "$NOTARY_ARCHIVE"
   else
     echo "Skipping notarization because --no-notarize was provided."
   fi
@@ -268,7 +281,7 @@ else
 fi
 
 echo "Creating distribution archive..."
-rm -f "$FINAL_ARCHIVE"
+delete_path_if_exists "$FINAL_ARCHIVE"
 /usr/bin/ditto -c -k --norsrc --keepParent "$APP_BUNDLE" "$FINAL_ARCHIVE"
 
 echo "Release package ready:"
