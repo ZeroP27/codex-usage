@@ -43,41 +43,43 @@ struct SettingsView: View {
                         .fixedSize(horizontal: false, vertical: true)
 
                     if store.usageDataSource == .oauthAPI {
-                        Text("OAuth API uses the Codex ChatGPT login in ~/.codex/auth.json. Stored tokens remain there and are refreshed in place when needed.")
+                        Text("OAuth API reads codex-auth accounts from ~/.codex/accounts. Token refresh writes only the account snapshot being refreshed, and syncs ~/.codex/auth.json only for the active account.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     }
                 }
 
-                Section("CLI RPC") {
-                    TextField("Codex executable", text: $draftExecutablePath)
-                        .textFieldStyle(.roundedBorder)
+                if store.usageDataSource == .cliRPC {
+                    Section("CLI RPC") {
+                        TextField("Codex executable", text: $draftExecutablePath)
+                            .textFieldStyle(.roundedBorder)
 
-                    HStack {
-                        Button("Apply") {
-                            store.updateCodexExecutablePath(draftExecutablePath)
+                        HStack {
+                            Button("Apply") {
+                                store.updateCodexExecutablePath(draftExecutablePath)
+                            }
+
+                            Button("Use Default") {
+                                store.resetCodexExecutablePath()
+                                draftExecutablePath = store.codexExecutablePath
+                            }
+
+                            Spacer()
                         }
 
-                        Button("Use Default") {
-                            store.resetCodexExecutablePath()
-                            draftExecutablePath = store.codexExecutablePath
-                        }
-
-                        Spacer()
+                        Text("Default search checks Codex.app, Homebrew, and PATH. CLI RPC starts a local stdio app-server for each refresh.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
-
-                    Text("Default search checks Codex.app, Homebrew, and PATH. CLI RPC starts a local stdio app-server for each refresh.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
                 }
 
                 Section("Current") {
                     SettingsInfoRow(title: "Source", value: store.snapshot.sourceDescription)
                     SettingsInfoRow(title: "Updated", value: UsageFormatters.updatedAt(store.snapshot.updatedAt))
-                    SettingsInfoRow(title: "Account", value: store.snapshot.account?.displayName ?? "--")
-                    SettingsInfoRow(title: "Plan", value: store.snapshot.account?.planType ?? "--")
+                    SettingsInfoRow(title: "Account", value: currentAccountName)
+                    SettingsInfoRow(title: "Plan", value: currentPlanLabel)
 
                     if let error = store.errorMessage {
                         Text(error)
@@ -93,16 +95,16 @@ struct SettingsView: View {
                 Spacer()
 
                 Button {
-                    store.refresh()
+                    store.refreshCurrentAccount()
                 } label: {
                     if store.isRefreshing {
                         ProgressView()
                             .controlSize(.small)
                     } else {
-                        Text("Refresh Now")
+                        Text("Refresh Current")
                     }
                 }
-                .disabled(store.isRefreshing)
+                .disabled(store.isRefreshing || store.activeUsageRow == nil)
             }
         }
         .padding(24)
@@ -113,6 +115,18 @@ struct SettingsView: View {
         .onChange(of: store.codexExecutablePath) { _, newValue in
             draftExecutablePath = newValue
         }
+    }
+
+    private var currentAccountName: String {
+        store.activeUsageRow?.account.displayName
+            ?? store.snapshot.account?.displayName
+            ?? "--"
+    }
+
+    private var currentPlanLabel: String {
+        store.activeUsageRow?.planLabel
+            ?? store.snapshot.account?.planLabel
+            ?? "--"
     }
 }
 
