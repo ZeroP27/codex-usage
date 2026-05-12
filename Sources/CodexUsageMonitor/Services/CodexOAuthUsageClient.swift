@@ -1,28 +1,57 @@
 import Foundation
+import OSLog
 
 struct CodexOAuthUsageClient {
     var timeout: TimeInterval = 30
+    private static let logger = Logger(
+        subsystem: "dev.idea-space.CodexUsageMonitor",
+        category: "OAuthUsage"
+    )
 
-    func loadSnapshot() async throws -> UsageSnapshot {
-        var credentials = try CodexOAuthCredentialsStore.load()
+    func loadSnapshot(
+        authFileURL: URL? = nil,
+        registryAccount: CodexManagedAccount? = nil,
+        activeAuthFileURL: URL? = nil
+    ) async throws -> UsageSnapshot {
+        let authFileURL = authFileURL ?? CodexOAuthCredentialsStore.authFileURL
+        var credentials = try CodexOAuthCredentialsStore.load(
+            from: authFileURL,
+            fallbackAccountID: registryAccount?.chatgptAccountID
+        )
 
-        if credentials.needsRefresh, !credentials.refreshToken.isEmpty {
-            do {
-                credentials = try await CodexOAuthTokenRefresher.refresh(credentials, timeout: timeout)
-                try CodexOAuthCredentialsStore.save(credentials)
-            } catch {
-                // Try the current access token once before surfacing a refresh failure.
-            }
+        if credentials.shouldRefreshBeforeUse {
+            credentials = try await CodexOAuthTokenRefresher.refresh(credentials, timeout: timeout)
+            try CodexOAuthCredentialsStore.save(credentials, to: authFileURL)
+            try syncActiveAuthIfNeeded(
+                authFileURL: authFileURL,
+                registryAccount: registryAccount,
+                activeAuthFileURL: activeAuthFileURL
+            )
+            Self.logger.info("refreshed token before usage key=\(registryAccount?.accountKey ?? "active", privacy: .private)")
         }
 
         do {
             let response = try await fetchUsage(credentials: credentials)
-            return try Self.makeSnapshot(response: response, credentials: credentials)
+            return try Self.makeSnapshot(
+                response: response,
+                credentials: credentials,
+                registryAccount: registryAccount
+            )
         } catch CodexOAuthUsageError.unauthorized where !credentials.refreshToken.isEmpty {
             credentials = try await CodexOAuthTokenRefresher.refresh(credentials, timeout: timeout)
-            try CodexOAuthCredentialsStore.save(credentials)
+            try CodexOAuthCredentialsStore.save(credentials, to: authFileURL)
+            try syncActiveAuthIfNeeded(
+                authFileURL: authFileURL,
+                registryAccount: registryAccount,
+                activeAuthFileURL: activeAuthFileURL
+            )
+            Self.logger.info("refreshed token after unauthorized key=\(registryAccount?.accountKey ?? "active", privacy: .private)")
             let response = try await fetchUsage(credentials: credentials)
-            return try Self.makeSnapshot(response: response, credentials: credentials)
+            return try Self.makeSnapshot(
+                response: response,
+                credentials: credentials,
+                registryAccount: registryAccount
+            )
         }
     }
 
@@ -86,7 +115,8 @@ struct CodexOAuthUsageClient {
 
     private static func makeSnapshot(
         response: CodexOAuthUsageResponse,
-        credentials: CodexOAuthCredentials) throws -> UsageSnapshot
+        credentials: CodexOAuthCredentials,
+        registryAccount: CodexManagedAccount?) throws -> UsageSnapshot
     {
         let windows = [
             ("primary", response.rateLimit?.primaryWindow),
@@ -121,15 +151,34 @@ struct CodexOAuthUsageClient {
         }
 
         let tokenPayload = credentials.idToken.flatMap(Self.parseJWT)
-        let email = Self.email(from: tokenPayload)
-        let plan = response.planType ?? Self.planType(from: tokenPayload)
+        let email = Self.email(from: tokenPayload) ?? registryAccount?.email
+        let plan = response.planType ?? Self.planType(from: tokenPayload) ?? registryAccount?.planType
 
         return UsageSnapshot(
-            account: CodexAccount(type: "chatgpt", email: email, planType: plan),
+            account: CodexAccount(
+                type: registryAccount?.authMode ?? "chatgpt",
+                email: email,
+                planType: plan
+            ),
             sessionWindow: session,
             weeklyWindow: weekly,
             updatedAt: Date(),
             sourceDescription: CodexUsageDataSource.oauthAPI.title
+        )
+    }
+
+    private func syncActiveAuthIfNeeded(
+        authFileURL: URL,
+        registryAccount: CodexManagedAccount?,
+        activeAuthFileURL: URL?
+    ) throws {
+        guard let registryAccount, let activeAuthFileURL else { return }
+        let registryStore = CodexAccountsRegistryStore(
+            codexHomeURL: activeAuthFileURL.deletingLastPathComponent()
+        )
+        try registryStore.syncActiveAuthIfAccountIsActive(
+            accountKey: registryAccount.accountKey,
+            authFileURL: authFileURL
         )
     }
 
@@ -167,15 +216,51 @@ struct CodexOAuthUsageClient {
 }
 
 private struct CodexOAuthCredentials {
+    private static let accessTokenRefreshLeeway: TimeInterval = 5 * 60
+
     var accessToken: String
     var refreshToken: String
     var idToken: String?
     var accountID: String?
     var lastRefresh: Date?
 
-    var needsRefresh: Bool {
+    var shouldRefreshBeforeUse: Bool {
+        guard !refreshToken.isEmpty else { return false }
+        if let expiresAt = accessTokenExpiresAt {
+            return expiresAt.timeIntervalSinceNow <= Self.accessTokenRefreshLeeway
+        }
         guard let lastRefresh else { return true }
         return Date().timeIntervalSince(lastRefresh) > 8 * 24 * 60 * 60
+    }
+
+    private var accessTokenExpiresAt: Date? {
+        Self.jwtExpirationDate(accessToken)
+    }
+
+    private static func jwtExpirationDate(_ token: String) -> Date? {
+        let parts = token.split(separator: ".")
+        guard parts.count >= 2 else { return nil }
+        var payload = String(parts[1])
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        let remainder = payload.count % 4
+        if remainder > 0 {
+            payload += String(repeating: "=", count: 4 - remainder)
+        }
+        guard let data = Data(base64Encoded: payload),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let exp = Self.timeIntervalValue(json["exp"])
+        else {
+            return nil
+        }
+        return Date(timeIntervalSince1970: exp)
+    }
+
+    private static func timeIntervalValue(_ value: Any?) -> TimeInterval? {
+        if let value = value as? TimeInterval { return value }
+        if let value = value as? Int { return TimeInterval(value) }
+        if let value = value as? String { return TimeInterval(value) }
+        return nil
     }
 }
 
@@ -190,11 +275,14 @@ private enum CodexOAuthCredentialsStore {
         return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex")
     }
 
-    private static var authFileURL: URL {
+    static var authFileURL: URL {
         codexHomeURL.appendingPathComponent("auth.json")
     }
 
-    static func load() throws -> CodexOAuthCredentials {
+    static func load(
+        from authFileURL: URL = Self.authFileURL,
+        fallbackAccountID: String? = nil
+    ) throws -> CodexOAuthCredentials {
         guard FileManager.default.fileExists(atPath: authFileURL.path) else {
             throw CodexOAuthUsageError.credentialsNotFound
         }
@@ -221,7 +309,11 @@ private enum CodexOAuthCredentialsStore {
             snakeCaseKey: "refresh_token",
             camelCaseKey: "refreshToken") ?? ""
         let idToken = Self.stringValue(in: tokens, snakeCaseKey: "id_token", camelCaseKey: "idToken")
-        let accountID = Self.stringValue(in: tokens, snakeCaseKey: "account_id", camelCaseKey: "accountId")
+        let accountID = Self.stringValue(
+            in: tokens,
+            snakeCaseKey: "account_id",
+            camelCaseKey: "accountId"
+        ) ?? fallbackAccountID
 
         return CodexOAuthCredentials(
             accessToken: accessToken,
@@ -232,15 +324,18 @@ private enum CodexOAuthCredentialsStore {
         )
     }
 
-    static func save(_ credentials: CodexOAuthCredentials) throws {
-        var json: [String: Any] = [:]
-        if let data = try? Data(contentsOf: authFileURL),
-           let existing = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        {
-            json = existing
+    static func save(
+        _ credentials: CodexOAuthCredentials,
+        to authFileURL: URL = Self.authFileURL
+    ) throws {
+        let existingData = try Data(contentsOf: authFileURL)
+        guard var json = try JSONSerialization.jsonObject(with: existingData) as? [String: Any] else {
+            throw CodexOAuthUsageError.decodeFailed("Invalid auth.json")
         }
 
-        var tokens = json["tokens"] as? [String: Any] ?? [:]
+        guard var tokens = json["tokens"] as? [String: Any] else {
+            throw CodexOAuthUsageError.missingTokens
+        }
         tokens["access_token"] = credentials.accessToken
         tokens["refresh_token"] = credentials.refreshToken
         if let idToken = credentials.idToken {
@@ -258,10 +353,20 @@ private enum CodexOAuthCredentialsStore {
             at: authFileURL.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
+        try Self.hardenManagedAccountsDirectoryIfNeeded(for: authFileURL)
         try data.write(to: authFileURL, options: .atomic)
         try FileManager.default.setAttributes(
             [.posixPermissions: 0o600],
             ofItemAtPath: authFileURL.path
+        )
+    }
+
+    private static func hardenManagedAccountsDirectoryIfNeeded(for authFileURL: URL) throws {
+        let directoryURL = authFileURL.deletingLastPathComponent()
+        guard directoryURL.lastPathComponent == "accounts" else { return }
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o700],
+            ofItemAtPath: directoryURL.path
         )
     }
 
