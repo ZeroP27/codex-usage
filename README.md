@@ -7,8 +7,8 @@ The menu bar view shows:
 
 - 5-hour quota remaining and reset time
 - Weekly quota remaining and reset time
-- Current account and plan when Codex reports them
-- Manual refresh and configurable auto-refresh
+- Multiple codex-auth accounts with current account and plan
+- Current-account refresh, all-account refresh, manual account switching, and configurable auto-refresh
 
 ## Requirements
 
@@ -35,9 +35,19 @@ Build output is written to `dist/`.
 
 ## Data Sources
 
-Codex Usage uses the OAuth API source by default. It reads Codex ChatGPT OAuth
-tokens from `~/.codex/auth.json` or `$CODEX_HOME/auth.json`, then calls the
-ChatGPT usage endpoint.
+Codex Usage uses the OAuth API source by default. It reads codex-auth account
+metadata from `~/.codex/accounts/registry.json` or
+`$CODEX_HOME/accounts/registry.json`, then calls the ChatGPT usage endpoint with
+each account snapshot under `accounts/`.
+
+The app does not auto-switch accounts when a quota threshold is reached. Account
+switching is manual: choosing an account copies the chosen account snapshot into
+`~/.codex/auth.json` and updates the active account fields in the registry.
+
+Configured auto-refresh intervals are jittered around the selected interval
+instead of firing at an exact fixed cadence. Automatic and stale menu refreshes
+refresh the current active account only; opening the Accounts panel refreshes
+all managed accounts.
 
 CLI RPC is available from Settings. That mode starts a local
 `codex app-server --listen stdio://` process and reads rate-limit data through
@@ -45,10 +55,12 @@ JSON-RPC.
 
 ## Privacy
 
-Codex Usage reads Codex credentials only from `~/.codex/auth.json` or
-`$CODEX_HOME/auth.json`. The app uses those tokens to call ChatGPT/OpenAI usage
-and OAuth refresh endpoints. When tokens are refreshed, the app writes them
-back to the same local auth file with owner-only permissions.
+Codex Usage reads Codex credentials from `~/.codex/auth.json` and
+`~/.codex/accounts/*.auth.json`, or the same paths under `$CODEX_HOME`. The app
+uses those tokens to call ChatGPT/OpenAI usage and OAuth refresh endpoints. When
+tokens are refreshed, the app writes them back to the specific account snapshot
+being refreshed with owner-only permissions. It syncs `~/.codex/auth.json` only
+when the refreshed account is the active account.
 
 The app stores local preferences in macOS UserDefaults: data source, refresh
 interval, and optional Codex executable path. It does not include analytics,
