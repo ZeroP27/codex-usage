@@ -1,0 +1,200 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, for example 0.3.0 or v0.3.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    name: Prepare Release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - name: Resolve version
+        id: version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            raw_version="$INPUT_VERSION"
+          else
+            raw_version="$REF_NAME"
+          fi
+
+          version="${raw_version#v}"
+
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release version must be numeric semver, for example 0.3.0." >&2
+            exit 1
+          fi
+
+          {
+            echo "version=$version"
+            echo "tag=v$version"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.asset_label }}
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - asset_label: aarch64
+            runner: macos-26
+            package_arch: arm64
+            expected_arch: arm64
+          - asset_label: x86_64
+            runner: macos-26-intel
+            package_arch: x86_64
+            expected_arch: x86_64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build release package
+        run: |
+          set -euo pipefail
+          ./script/package_release.sh \
+            --version "${{ needs.prepare.outputs.version }}" \
+            --build "${{ needs.prepare.outputs.version }}" \
+            --unsigned \
+            --arch "${{ matrix.package_arch }}"
+
+      - name: Validate bundle
+        run: |
+          set -euo pipefail
+
+          app_path="dist/release/Codex Usage.app"
+          binary_path="$app_path/Contents/MacOS/CodexUsageMonitor"
+          plist_path="$app_path/Contents/Info.plist"
+
+          plutil -lint "$plist_path"
+
+          bundle_version="$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$plist_path")"
+          if [[ "$bundle_version" != "${{ needs.prepare.outputs.version }}" ]]; then
+            echo "Expected CFBundleShortVersionString ${{ needs.prepare.outputs.version }}, got $bundle_version." >&2
+            exit 1
+          fi
+
+          archs="$(lipo -archs "$binary_path")"
+          if [[ "$archs" != "${{ matrix.expected_arch }}" ]]; then
+            echo "Expected binary architecture ${{ matrix.expected_arch }}, got $archs." >&2
+            exit 1
+          fi
+
+      - name: Rename package
+        id: package
+        run: |
+          set -euo pipefail
+
+          source_zip="dist/release/Codex-Usage-${{ needs.prepare.outputs.version }}-${{ matrix.package_arch }}.zip"
+          release_zip="dist/release/Codex-Usage-${{ needs.prepare.outputs.version }}-${{ matrix.asset_label }}.zip"
+
+          if [[ ! -f "$source_zip" ]]; then
+            echo "Expected release zip not found: $source_zip" >&2
+            exit 1
+          fi
+
+          mv "$source_zip" "$release_zip"
+          shasum -a 256 "$release_zip" > "$release_zip.sha256"
+
+          {
+            echo "zip_name=$(basename "$release_zip")"
+            echo "sha_name=$(basename "$release_zip.sha256")"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-usage-${{ matrix.asset_label }}
+          path: |
+            dist/release/${{ steps.package.outputs.zip_name }}
+            dist/release/${{ steps.package.outputs.sha_name }}
+          if-no-files-found: error
+
+  release:
+    name: Publish Release
+    needs:
+      - prepare
+      - build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/release
+          pattern: codex-usage-*
+          merge-multiple: true
+
+      - name: Build release notes
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          previous_tag="$(git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | grep -v "^$TAG$" | head -n 1 || true)"
+
+          if [[ -n "$previous_tag" ]]; then
+            change_range="$previous_tag..HEAD"
+          else
+            change_range="HEAD"
+          fi
+
+          {
+            echo "Changes"
+            git log --pretty=format:'- %s' "$change_range"
+            echo
+            echo
+            echo "Downloads"
+            echo "- Apple Silicon: Codex-Usage-$VERSION-aarch64.zip"
+            echo "- Intel: Codex-Usage-$VERSION-x86_64.zip"
+            echo
+            echo "SHA-256"
+            while IFS= read -r checksum_line; do
+              checksum="${checksum_line%% *}"
+              file_path="${checksum_line#*  }"
+              echo "- $(basename "$file_path"): $checksum"
+            done < <(cat dist/release/*.sha256 | sort -k 2)
+          } > release-notes.md
+
+          cat release-notes.md
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          gh release create "$TAG" \
+            dist/release/Codex-Usage-"$VERSION"-aarch64.zip \
+            dist/release/Codex-Usage-"$VERSION"-x86_64.zip \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Codex Usage $TAG" \
+            --notes-file release-notes.md

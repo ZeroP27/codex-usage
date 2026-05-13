@@ -33,6 +33,17 @@ To create a local unsigned app bundle and zip:
 
 Build output is written to `dist/`.
 
+## Release Automation
+
+GitHub Actions publishes releases when a version tag such as `v0.3.0` is
+pushed, or when the Release workflow is run manually with a version. The
+workflow builds separate macOS packages for Apple Silicon and Intel:
+
+- `Codex-Usage-<version>-aarch64.zip`
+- `Codex-Usage-<version>-x86_64.zip`
+
+Release notes list commit-derived changes, download names, and SHA-256 checksums.
+
 ## Data Sources
 
 Codex Usage uses the OAuth API source by default. It reads codex-auth account
