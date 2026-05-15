@@ -12,7 +12,11 @@ on:
         type: string
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
   prepare:
@@ -136,6 +140,8 @@ jobs:
       - prepare
       - build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -148,6 +154,34 @@ jobs:
           path: dist/release
           pattern: codex-usage-*
           merge-multiple: true
+
+      - name: Validate release assets
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          expected_assets=(
+            "Codex-Usage-$VERSION-aarch64.zip"
+            "Codex-Usage-$VERSION-x86_64.zip"
+          )
+
+          for asset in "${expected_assets[@]}"; do
+            asset_path="dist/release/$asset"
+            checksum_path="$asset_path.sha256"
+
+            if [[ ! -f "$asset_path" ]]; then
+              echo "Expected release asset not found: $asset_path" >&2
+              exit 1
+            fi
+
+            if [[ ! -f "$checksum_path" ]]; then
+              echo "Expected checksum file not found: $checksum_path" >&2
+              exit 1
+            fi
+
+            shasum -a 256 -c "$checksum_path"
+          done
 
       - name: Build release notes
         env:
