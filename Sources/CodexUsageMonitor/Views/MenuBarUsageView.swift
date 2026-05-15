@@ -1,10 +1,15 @@
 import AppKit
+import OSLog
 import SwiftUI
 
 struct MenuBarUsageView: View {
     @ObservedObject var store: CodexUsageStore
     @Environment(\.openSettings) private var openSettings
     @State private var activePanel = MenuPanel.summary
+    private static let logger = Logger(
+        subsystem: "dev.idea-space.CodexUsageMonitor",
+        category: "MenuBar"
+    )
 
     var body: some View {
         Group {
@@ -14,6 +19,7 @@ struct MenuBarUsageView: View {
             case .accounts:
                 AccountsPanel(
                     rows: store.accountRows,
+                    isRefreshing: store.isRefreshing,
                     isRefreshingAll: store.isRefreshingAll,
                     isActivatingAccount: store.isActivatingAccount,
                     activate: store.activateAccount,
@@ -62,7 +68,7 @@ struct MenuBarUsageView: View {
                     .padding(.vertical, 18)
             }
 
-            if store.accountRows.count > 1 {
+            if shouldShowAccountsNavigation {
                 Divider()
 
                 SecondaryNavigationRow(
@@ -81,11 +87,13 @@ struct MenuBarUsageView: View {
 
             HStack {
                 Button("Settings") {
+                    Self.logger.info("settings opened from menu bar")
                     openSettingsWindow()
                 }
                 .keyboardShortcut(.defaultAction)
 
                 Button("Refresh") {
+                    Self.logger.info("summary refresh clicked active_present=\((store.activeUsageRow != nil), privacy: .public)")
                     store.refreshCurrentAccount()
                 }
                 .disabled(store.isRefreshing || store.activeUsageRow == nil)
@@ -100,12 +108,19 @@ struct MenuBarUsageView: View {
     }
 
     private var accountSummaryText: String {
-        "\(store.accountRows.count) accounts"
+        store.accountRows.count == 1
+            ? "1 account"
+            : "\(store.accountRows.count) accounts"
+    }
+
+    private var shouldShowAccountsNavigation: Bool {
+        store.accountRows.count > 1
+            || (store.activeUsageRow == nil && !store.accountRows.isEmpty)
     }
 
     private func openAccountsPanel() {
+        Self.logger.info("accounts panel opened row_count=\(store.accountRows.count, privacy: .public) active_present=\((store.activeUsageRow != nil), privacy: .public)")
         activePanel = .accounts
-        store.refresh()
     }
 }
 
@@ -172,7 +187,12 @@ private struct MenuHeaderView: View {
 }
 
 private struct AccountsPanel: View {
+    private static let logger = Logger(
+        subsystem: "dev.idea-space.CodexUsageMonitor",
+        category: "MenuBar"
+    )
     var rows: [AccountUsageRow]
+    var isRefreshing: Bool
     var isRefreshingAll: Bool
     var isActivatingAccount: Bool
     var activate: (String) -> Void
@@ -210,13 +230,15 @@ private struct AccountsPanel: View {
 
             HStack {
                 Button("Refresh All") {
+                    Self.logger.info("accounts panel refresh all clicked row_count=\(rows.count, privacy: .public)")
                     refresh()
                 }
-                .disabled(isRefreshingAll)
+                .disabled(isRefreshing || rows.isEmpty)
 
                 Spacer()
 
                 Button("Done") {
+                    Self.logger.info("accounts panel done clicked")
                     back()
                 }
             }
@@ -240,6 +262,7 @@ private struct AccountsPanel: View {
             ForEach(rows) { row in
                 AccountMenuRow(
                     row: row,
+                    isRefreshing: isRefreshing,
                     isRefreshingAll: isRefreshingAll,
                     isActivatingAccount: isActivatingAccount,
                     activate: activate,
@@ -281,7 +304,12 @@ private struct SecondaryNavigationRow: View {
 }
 
 private struct AccountMenuRow: View {
+    private static let logger = Logger(
+        subsystem: "dev.idea-space.CodexUsageMonitor",
+        category: "MenuBar"
+    )
     var row: AccountUsageRow
+    var isRefreshing: Bool
     var isRefreshingAll: Bool
     var isActivatingAccount: Bool
     var activate: (String) -> Void
@@ -290,6 +318,7 @@ private struct AccountMenuRow: View {
     var body: some View {
         HStack(alignment: .center, spacing: 8) {
             Button {
+                Self.logger.info("account switch clicked key_fp=\(LogFingerprint.account(row.id), privacy: .public) key=\(row.id, privacy: .private) is_active=\(row.isActive, privacy: .public)")
                 activate(row.id)
             } label: {
                 Image(systemName: switchSymbol)
@@ -298,7 +327,7 @@ private struct AccountMenuRow: View {
                     .frame(width: 22, height: 22)
             }
             .buttonStyle(.borderless)
-            .disabled(row.isActive || isActivatingAccount)
+            .disabled(row.isActive || isActivatingAccount || isRefreshing)
             .help(row.isActive ? "Active account" : "Switch Codex to this account")
 
             VStack(alignment: .leading, spacing: 7) {
@@ -329,6 +358,7 @@ private struct AccountMenuRow: View {
             .frame(maxWidth: .infinity, alignment: .leading)
 
             Button {
+                Self.logger.info("account row refresh clicked key_fp=\(LogFingerprint.account(row.id), privacy: .public) key=\(row.id, privacy: .private)")
                 refreshAccount(row.id)
             } label: {
                 if row.isRefreshing {
@@ -342,7 +372,7 @@ private struct AccountMenuRow: View {
                 }
             }
             .buttonStyle(.borderless)
-            .disabled(row.isRefreshing || isRefreshingAll)
+            .disabled(row.isRefreshing || isRefreshing || isRefreshingAll || isActivatingAccount)
             .help("Refresh this account quota")
         }
         .padding(9)

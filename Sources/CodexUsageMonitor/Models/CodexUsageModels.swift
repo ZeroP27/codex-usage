@@ -35,7 +35,7 @@ enum CodexUsageDataSource: String, CaseIterable, Identifiable, Sendable {
     var title: String {
         switch self {
         case .oauthAPI:
-            return "OAuth API"
+            return "Managed Accounts"
         case .cliRPC:
             return "CLI RPC"
         }
@@ -44,7 +44,7 @@ enum CodexUsageDataSource: String, CaseIterable, Identifiable, Sendable {
     var detail: String {
         switch self {
         case .oauthAPI:
-            return "Read Codex OAuth tokens and call the ChatGPT usage endpoint."
+            return "Use Codex Usage managed ChatGPT accounts and refresh quota directly."
         case .cliRPC:
             return "Start codex app-server locally and read rate limits through JSON-RPC."
         }
@@ -182,7 +182,7 @@ enum CodexPlanLabels {
     }
 }
 
-struct CodexAccountsRegistrySnapshot: Equatable, Sendable {
+struct CodexManagedAccountsSnapshot: Equatable, Sendable {
     var schemaVersion: Int
     var activeAccountKey: String?
     var accounts: [CodexManagedAccount]

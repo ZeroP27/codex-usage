@@ -7,14 +7,14 @@ The menu bar view shows:
 
 - 5-hour quota remaining and reset time
 - Weekly quota remaining and reset time
-- Multiple codex-auth accounts with current account and plan
+- Managed ChatGPT accounts with current account and plan
 - Current-account refresh, all-account refresh, manual account switching, and configurable auto-refresh
 
 ## Requirements
 
 - macOS 14 or later
 - Swift 6 toolchain or Xcode Command Line Tools
-- Codex signed in with a ChatGPT account
+- Codex CLI available for adding accounts through `codex app-server`
 
 ## Build And Run
 
@@ -46,19 +46,27 @@ Release notes list commit-derived changes, download names, and SHA-256 checksums
 
 ## Data Sources
 
-Codex Usage uses the OAuth API source by default. It reads codex-auth account
-metadata from `~/.codex/accounts/registry.json` or
-`$CODEX_HOME/accounts/registry.json`, then calls the ChatGPT usage endpoint with
-each account snapshot under `accounts/`.
+Codex Usage uses the Managed Accounts source by default. Accounts are added from
+Settings. The app starts `codex app-server --listen stdio://` with a temporary
+`CODEX_HOME`, opens the ChatGPT login URL returned by Codex, and stores the
+resulting auth snapshot under:
+
+```text
+~/Library/Application Support/Codex Usage/accounts/
+```
+
+The account registry is `registry.json`; each account auth snapshot is stored as
+`<account_key>.auth.json`. Account files are written with owner-only
+permissions. The app does not read or write `~/.codex/accounts`.
 
 The app does not auto-switch accounts when a quota threshold is reached. Account
 switching is manual: choosing an account copies the chosen account snapshot into
-`~/.codex/auth.json` and updates the active account fields in the registry.
+`~/.codex/auth.json` and updates the active account in the Codex Usage registry.
 
 Configured auto-refresh intervals are jittered around the selected interval
 instead of firing at an exact fixed cadence. Automatic and stale menu refreshes
-refresh the current active account only; opening the Accounts panel refreshes
-all managed accounts.
+refresh the current active account only. The Accounts panel can manually refresh
+individual accounts or all managed accounts.
 
 CLI RPC is available from Settings. That mode starts a local
 `codex app-server --listen stdio://` process and reads rate-limit data through
@@ -66,12 +74,15 @@ JSON-RPC.
 
 ## Privacy
 
-Codex Usage reads Codex credentials from `~/.codex/auth.json` and
-`~/.codex/accounts/*.auth.json`, or the same paths under `$CODEX_HOME`. The app
-uses those tokens to call ChatGPT/OpenAI usage and OAuth refresh endpoints. When
-tokens are refreshed, the app writes them back to the specific account snapshot
-being refreshed with owner-only permissions. It syncs `~/.codex/auth.json` only
-when the refreshed account is the active account.
+Codex Usage stores managed account credentials as local JSON files under its
+Application Support directory. It uses those tokens to call ChatGPT/OpenAI usage
+and OAuth refresh endpoints. When tokens are refreshed, the app writes them back
+to the specific managed account snapshot being refreshed with owner-only
+permissions. It syncs `~/.codex/auth.json` only when switching accounts or when
+the refreshed account is the current active account.
+
+The app does not use Keychain for managed accounts and does not depend on
+codex-auth.
 
 The app stores local preferences in macOS UserDefaults: data source, refresh
 interval, and optional Codex executable path. It does not include analytics,

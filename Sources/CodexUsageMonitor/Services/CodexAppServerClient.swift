@@ -1,9 +1,16 @@
+import AppKit
 import Foundation
 import Darwin
+import OSLog
 
 struct CodexAppServerClient {
     var executablePath: String
     var timeout: TimeInterval = 15
+    var loginTimeout: TimeInterval = 300
+    private static let logger = Logger(
+        subsystem: "dev.idea-space.CodexUsageMonitor",
+        category: "AppServer"
+    )
 
     func loadSnapshot() throws -> UsageSnapshot {
         let executableURL = try CodexExecutableResolver.resolve(executablePath)
@@ -71,7 +78,144 @@ struct CodexAppServerClient {
         )
     }
 
-    private static func processEnvironment(for executableURL: URL) -> [String: String] {
+    func loginChatGPTAuthData() throws -> Data {
+        let executableURL = try CodexExecutableResolver.resolve(executablePath)
+        let tempRootURL = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "codex-usage-login-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        let tempCodexHomeURL = tempRootURL.appendingPathComponent("codex-home", isDirectory: true)
+
+        try FileManager.default.createDirectory(
+            at: tempCodexHomeURL,
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o700],
+            ofItemAtPath: tempRootURL.path
+        )
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o700],
+            ofItemAtPath: tempCodexHomeURL.path
+        )
+        try "cli_auth_credentials_store = \"file\"\n".write(
+            to: tempCodexHomeURL.appendingPathComponent("config.toml"),
+            atomically: true,
+            encoding: .utf8
+        )
+        Self.logger.info("chatgpt login prepared executable=\(executableURL.path, privacy: .private) temp_codex_home=\(tempCodexHomeURL.path, privacy: .private)")
+
+        defer {
+            do {
+                try FileManager.default.removeItem(at: tempRootURL)
+            } catch {
+                Self.logger.error("failed to remove temporary login directory error_type=\(LogErrorSummary.category(error), privacy: .public) error=\(error.localizedDescription, privacy: .private)")
+            }
+        }
+
+        let process = Process()
+        process.executableURL = executableURL
+        process.arguments = ["app-server", "--listen", "stdio://"]
+        process.environment = Self.processEnvironment(
+            for: executableURL,
+            codexHomeURL: tempCodexHomeURL
+        )
+
+        let inputPipe = Pipe()
+        let outputPipe = Pipe()
+        let errorPipe = Pipe()
+        process.standardInput = inputPipe
+        process.standardOutput = outputPipe
+        process.standardError = errorPipe
+
+        do {
+            try process.run()
+            Self.logger.info("chatgpt login app-server started pid=\(process.processIdentifier, privacy: .public)")
+        } catch {
+            Self.logger.error("chatgpt login app-server launch failed error_type=\(LogErrorSummary.category(error), privacy: .public) error=\(error.localizedDescription, privacy: .private)")
+            throw CodexAppServerError.launchFailed(error.localizedDescription)
+        }
+
+        let rpc = AppServerRPCConnection(
+            input: inputPipe.fileHandleForWriting,
+            output: outputPipe.fileHandleForReading,
+            error: errorPipe.fileHandleForReading
+        )
+
+        defer {
+            rpc.close()
+            Self.stop(process)
+        }
+
+        let _: EmptyRPCResult = try rpc.request(
+            id: 1,
+            method: "initialize",
+            params: [
+                "clientInfo": [
+                    "name": "codex_usage_monitor",
+                    "title": "Codex Usage",
+                    "version": "0.1.0"
+                ]
+            ],
+            timeout: timeout
+        )
+        try rpc.notify(method: "initialized", params: [:])
+
+        let login: AccountLoginStartResult = try rpc.request(
+            id: 2,
+            method: "account/login/start",
+            params: ["type": "chatgpt"],
+            timeout: timeout
+        )
+        Self.logger.info("chatgpt login start returned login_id_present=\((login.loginId?.isEmpty == false), privacy: .public) auth_url_host=\(URL(string: login.authUrl ?? "")?.host ?? "missing", privacy: .public)")
+
+        guard let loginID = login.loginId?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !loginID.isEmpty
+        else {
+            throw CodexAppServerError.loginFailed("codex app-server did not return a login id.")
+        }
+
+        guard let authURLString = login.authUrl,
+              let authURL = URL(string: authURLString)
+        else {
+            throw CodexAppServerError.loginFailed("codex app-server did not return a browser login URL.")
+        }
+
+        guard Self.isAllowedAuthenticationURL(authURL) else {
+            Self.logger.error("chatgpt login rejected unexpected auth_url_host=\(authURL.host ?? "missing", privacy: .public)")
+            throw CodexAppServerError.loginFailed("codex app-server returned an unexpected login URL host.")
+        }
+
+        guard Self.openAuthenticationURL(authURL) else {
+            Self.logger.error("chatgpt login failed to open auth_url_host=\(authURL.host ?? "missing", privacy: .public)")
+            throw CodexAppServerError.loginFailed("Could not open the ChatGPT login URL.")
+        }
+        Self.logger.info("chatgpt login opened auth_url_host=\(authURL.host ?? "missing", privacy: .public)")
+
+        let completed = try rpc.waitForNotification(
+            method: "account/login/completed",
+            loginID: loginID,
+            timeout: loginTimeout
+        )
+        let params = completed["params"] as? [String: Any]
+        let success = params?["success"] as? Bool ?? false
+        Self.logger.info("chatgpt login completed notification success=\(success, privacy: .public)")
+        guard success else {
+            let message = params?["error"] as? String ?? "ChatGPT login did not complete."
+            throw CodexAppServerError.loginFailed(message)
+        }
+
+        let authFileURL = tempCodexHomeURL.appendingPathComponent("auth.json")
+        guard FileManager.default.fileExists(atPath: authFileURL.path) else {
+            Self.logger.error("chatgpt login completed without auth file path=\(authFileURL.path, privacy: .private)")
+            throw CodexAppServerError.authFileMissing(authFileURL.path)
+        }
+        Self.logger.info("chatgpt login auth file ready path=\(authFileURL.path, privacy: .private)")
+
+        return try Data(contentsOf: authFileURL)
+    }
+
+    private static func processEnvironment(for executableURL: URL, codexHomeURL: URL? = nil) -> [String: String] {
         var environment = ProcessInfo.processInfo.environment
         let fallbackPath = [
             executableURL.deletingLastPathComponent().path,
@@ -88,7 +232,35 @@ struct CodexAppServerClient {
         } else {
             environment["PATH"] = fallbackPath
         }
+        if let codexHomeURL {
+            environment["CODEX_HOME"] = codexHomeURL.path
+        }
         return environment
+    }
+
+    private static func openAuthenticationURL(_ url: URL) -> Bool {
+        if Thread.isMainThread {
+            return NSWorkspace.shared.open(url)
+        }
+
+        var opened = false
+        DispatchQueue.main.sync {
+            opened = NSWorkspace.shared.open(url)
+        }
+        return opened
+    }
+
+    private static func isAllowedAuthenticationURL(_ url: URL) -> Bool {
+        guard url.scheme?.lowercased() == "https",
+              let host = url.host?.lowercased()
+        else {
+            return false
+        }
+
+        return host == "openai.com"
+            || host.hasSuffix(".openai.com")
+            || host == "chatgpt.com"
+            || host.hasSuffix(".chatgpt.com")
     }
 
     private static func stop(_ process: Process) {
@@ -177,6 +349,8 @@ enum CodexAppServerError: LocalizedError {
     case timedOut(String)
     case invalidResponse(String)
     case missingRateLimitData
+    case loginFailed(String)
+    case authFileMissing(String)
 
     var errorDescription: String? {
         switch self {
@@ -194,6 +368,10 @@ enum CodexAppServerError: LocalizedError {
             return "Unexpected codex app-server response: \(message)"
         case .missingRateLimitData:
             return "Codex app-server did not return ChatGPT rate limit data. Sign in to Codex with a ChatGPT account, then refresh."
+        case .loginFailed(let message):
+            return "Codex ChatGPT login failed: \(message)"
+        case .authFileMissing(let path):
+            return "Codex ChatGPT login did not create auth.json at \(path)."
         }
     }
 }
@@ -306,6 +484,28 @@ private final class AppServerRPCConnection: @unchecked Sendable {
         ])
     }
 
+    func waitForNotification(
+        method: String,
+        loginID: String,
+        timeout: TimeInterval
+    ) throws -> [String: Any] {
+        let deadline = Date().addingTimeInterval(timeout)
+
+        while true {
+            if let notification = popNotification(method: method, loginID: loginID) {
+                return notification
+            }
+
+            let remaining = deadline.timeIntervalSinceNow
+            if remaining <= 0 {
+                throw CodexAppServerError.timedOut(stderrText())
+            }
+
+            let waitMs = max(1, min(Int(remaining * 1000), 250))
+            _ = semaphore.wait(timeout: .now() + .milliseconds(waitMs))
+        }
+    }
+
     func close() {
         lock.lock()
         guard !closed else {
@@ -371,6 +571,19 @@ private final class AppServerRPCConnection: @unchecked Sendable {
         return messages.remove(at: index)
     }
 
+    private func popNotification(method: String, loginID: String) -> [String: Any]? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let index = messages.firstIndex(where: { message in
+            guard message["method"] as? String == method else { return false }
+            let params = message["params"] as? [String: Any]
+            return params?["loginId"] as? String == loginID
+        }) else {
+            return nil
+        }
+        return messages.remove(at: index)
+    }
+
     private func ingestOutput(_ data: Data) {
         guard !data.isEmpty else {
             semaphore.signal()
@@ -421,6 +634,11 @@ private struct AccountPayload: Decodable {
     var type: String
     var email: String?
     var planType: String?
+}
+
+private struct AccountLoginStartResult: Decodable {
+    var loginId: String?
+    var authUrl: String?
 }
 
 private struct RateLimitsReadResult: Decodable {

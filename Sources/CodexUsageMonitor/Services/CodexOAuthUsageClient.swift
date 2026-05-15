@@ -10,13 +10,13 @@ struct CodexOAuthUsageClient {
 
     func loadSnapshot(
         authFileURL: URL? = nil,
-        registryAccount: CodexManagedAccount? = nil,
+        managedAccount: CodexManagedAccount? = nil,
         activeAuthFileURL: URL? = nil
     ) async throws -> UsageSnapshot {
         let authFileURL = authFileURL ?? CodexOAuthCredentialsStore.authFileURL
         var credentials = try CodexOAuthCredentialsStore.load(
             from: authFileURL,
-            fallbackAccountID: registryAccount?.chatgptAccountID
+            fallbackAccountID: managedAccount?.chatgptAccountID
         )
 
         if credentials.shouldRefreshBeforeUse {
@@ -24,10 +24,10 @@ struct CodexOAuthUsageClient {
             try CodexOAuthCredentialsStore.save(credentials, to: authFileURL)
             try syncActiveAuthIfNeeded(
                 authFileURL: authFileURL,
-                registryAccount: registryAccount,
+                managedAccount: managedAccount,
                 activeAuthFileURL: activeAuthFileURL
             )
-            Self.logger.info("refreshed token before usage key=\(registryAccount?.accountKey ?? "active", privacy: .private)")
+            Self.logger.info("refreshed token before usage key=\(managedAccount?.accountKey ?? "active", privacy: .private)")
         }
 
         do {
@@ -35,22 +35,22 @@ struct CodexOAuthUsageClient {
             return try Self.makeSnapshot(
                 response: response,
                 credentials: credentials,
-                registryAccount: registryAccount
+                managedAccount: managedAccount
             )
         } catch CodexOAuthUsageError.unauthorized where !credentials.refreshToken.isEmpty {
             credentials = try await CodexOAuthTokenRefresher.refresh(credentials, timeout: timeout)
             try CodexOAuthCredentialsStore.save(credentials, to: authFileURL)
             try syncActiveAuthIfNeeded(
                 authFileURL: authFileURL,
-                registryAccount: registryAccount,
+                managedAccount: managedAccount,
                 activeAuthFileURL: activeAuthFileURL
             )
-            Self.logger.info("refreshed token after unauthorized key=\(registryAccount?.accountKey ?? "active", privacy: .private)")
+            Self.logger.info("refreshed token after unauthorized key=\(managedAccount?.accountKey ?? "active", privacy: .private)")
             let response = try await fetchUsage(credentials: credentials)
             return try Self.makeSnapshot(
                 response: response,
                 credentials: credentials,
-                registryAccount: registryAccount
+                managedAccount: managedAccount
             )
         }
     }
@@ -66,6 +66,7 @@ struct CodexOAuthUsageClient {
         if let accountID = credentials.accountID, !accountID.isEmpty {
             request.setValue(accountID, forHTTPHeaderField: "ChatGPT-Account-Id")
         }
+        Self.logger.info("fetching oauth usage account_id_present=\((credentials.accountID?.isEmpty == false), privacy: .public) account_id_fp=\(LogFingerprint.account(credentials.accountID), privacy: .public) account_id=\(credentials.accountID ?? "missing", privacy: .private)")
 
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
@@ -116,7 +117,7 @@ struct CodexOAuthUsageClient {
     private static func makeSnapshot(
         response: CodexOAuthUsageResponse,
         credentials: CodexOAuthCredentials,
-        registryAccount: CodexManagedAccount?) throws -> UsageSnapshot
+        managedAccount: CodexManagedAccount?) throws -> UsageSnapshot
     {
         let windows = [
             ("primary", response.rateLimit?.primaryWindow),
@@ -151,12 +152,12 @@ struct CodexOAuthUsageClient {
         }
 
         let tokenPayload = credentials.idToken.flatMap(Self.parseJWT)
-        let email = Self.email(from: tokenPayload) ?? registryAccount?.email
-        let plan = response.planType ?? Self.planType(from: tokenPayload) ?? registryAccount?.planType
+        let email = Self.email(from: tokenPayload) ?? managedAccount?.email
+        let plan = response.planType ?? Self.planType(from: tokenPayload) ?? managedAccount?.planType
 
         return UsageSnapshot(
             account: CodexAccount(
-                type: registryAccount?.authMode ?? "chatgpt",
+                type: managedAccount?.authMode ?? "chatgpt",
                 email: email,
                 planType: plan
             ),
@@ -169,15 +170,15 @@ struct CodexOAuthUsageClient {
 
     private func syncActiveAuthIfNeeded(
         authFileURL: URL,
-        registryAccount: CodexManagedAccount?,
+        managedAccount: CodexManagedAccount?,
         activeAuthFileURL: URL?
     ) throws {
-        guard let registryAccount, let activeAuthFileURL else { return }
-        let registryStore = CodexAccountsRegistryStore(
+        guard let managedAccount, let activeAuthFileURL else { return }
+        let accountStore = CodexUsageAccountStore(
             codexHomeURL: activeAuthFileURL.deletingLastPathComponent()
         )
-        try registryStore.syncActiveAuthIfAccountIsActive(
-            accountKey: registryAccount.accountKey,
+        try accountStore.syncActiveAuthIfAccountIsActive(
+            accountKey: managedAccount.accountKey,
             authFileURL: authFileURL
         )
     }
@@ -215,7 +216,7 @@ struct CodexOAuthUsageClient {
     }
 }
 
-private struct CodexOAuthCredentials {
+struct CodexOAuthCredentials {
     private static let accessTokenRefreshLeeway: TimeInterval = 5 * 60
 
     var accessToken: String
@@ -264,7 +265,91 @@ private struct CodexOAuthCredentials {
     }
 }
 
-private enum CodexOAuthCredentialsStore {
+struct CodexOAuthAccountInfo: Equatable, Sendable {
+    var accountKey: String
+    var chatgptAccountID: String
+    var chatgptUserID: String
+    var email: String
+    var planType: String?
+    var accountIDSource: String
+}
+
+extension CodexOAuthCredentials {
+    func accountInfo() throws -> CodexOAuthAccountInfo {
+        guard let idToken, !idToken.isEmpty else {
+            throw CodexOAuthUsageError.missingAccountInfo("id_token is missing.")
+        }
+        guard let payload = Self.jwtPayload(idToken) else {
+            throw CodexOAuthUsageError.missingAccountInfo("id_token payload could not be decoded.")
+        }
+
+        let auth = payload["https://api.openai.com/auth"] as? [String: Any]
+        let profile = payload["https://api.openai.com/profile"] as? [String: Any]
+
+        guard let email = trimmedString(payload["email"] ?? profile?["email"])?.lowercased() else {
+            throw CodexOAuthUsageError.missingAccountInfo("email is missing from id_token.")
+        }
+
+        let jwtAccountID = trimmedString(auth?["chatgpt_account_id"])
+        let tokenAccountID = accountID?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let chatgptAccountID: String?
+        let accountIDSource: String
+        if let tokenAccountID, !tokenAccountID.isEmpty {
+            chatgptAccountID = tokenAccountID
+            accountIDSource = "tokens.account_id"
+        } else {
+            chatgptAccountID = jwtAccountID
+            accountIDSource = "id_token"
+        }
+        guard let chatgptAccountID, !chatgptAccountID.isEmpty else {
+            throw CodexOAuthUsageError.missingAccountInfo("ChatGPT account id is missing.")
+        }
+        if let jwtAccountID, !jwtAccountID.isEmpty, jwtAccountID != chatgptAccountID {
+            throw CodexOAuthUsageError.missingAccountInfo("ChatGPT account id does not match id_token.")
+        }
+
+        let chatgptUserID = trimmedString(auth?["chatgpt_user_id"] ?? auth?["user_id"])
+        guard let chatgptUserID, !chatgptUserID.isEmpty else {
+            throw CodexOAuthUsageError.missingAccountInfo("ChatGPT user id is missing.")
+        }
+
+        let planType = trimmedString(auth?["chatgpt_plan_type"] ?? payload["chatgpt_plan_type"])
+        return CodexOAuthAccountInfo(
+            accountKey: "\(chatgptUserID)::\(chatgptAccountID)",
+            chatgptAccountID: chatgptAccountID,
+            chatgptUserID: chatgptUserID,
+            email: email,
+            planType: planType,
+            accountIDSource: accountIDSource
+        )
+    }
+
+    private static func jwtPayload(_ token: String) -> [String: Any]? {
+        let parts = token.split(separator: ".")
+        guard parts.count >= 2 else { return nil }
+        var payload = String(parts[1])
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        let remainder = payload.count % 4
+        if remainder > 0 {
+            payload += String(repeating: "=", count: 4 - remainder)
+        }
+        guard let data = Data(base64Encoded: payload),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else {
+            return nil
+        }
+        return json
+    }
+
+    private func trimmedString(_ value: Any?) -> String? {
+        guard let value = value as? String else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+}
+
+enum CodexOAuthCredentialsStore {
     static var codexHomeURL: URL {
         if let configured = ProcessInfo.processInfo.environment["CODEX_HOME"]?
             .trimmingCharacters(in: .whitespacesAndNewlines),
@@ -288,6 +373,13 @@ private enum CodexOAuthCredentialsStore {
         }
 
         let data = try Data(contentsOf: authFileURL)
+        return try load(from: data, fallbackAccountID: fallbackAccountID)
+    }
+
+    static func load(
+        from data: Data,
+        fallbackAccountID: String? = nil
+    ) throws -> CodexOAuthCredentials {
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw CodexOAuthUsageError.decodeFailed("Invalid auth.json")
         }
@@ -546,6 +638,7 @@ private struct CodexOAuthUsageResponse: Decodable {
 enum CodexOAuthUsageError: LocalizedError {
     case credentialsNotFound
     case missingTokens
+    case missingAccountInfo(String)
     case unauthorized
     case invalidResponse
     case decodeFailed(String)
@@ -556,11 +649,13 @@ enum CodexOAuthUsageError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .credentialsNotFound:
-            return "Codex OAuth credentials were not found. Sign in with Codex, or switch Settings to CLI RPC."
+            return "Managed account credentials were not found. Add the account again in Settings."
         case .missingTokens:
-            return "Codex auth.json does not contain ChatGPT OAuth tokens. Sign in with Codex, or switch Settings to CLI RPC."
+            return "Managed account auth data does not contain ChatGPT OAuth tokens. Add the account again in Settings."
+        case .missingAccountInfo(let message):
+            return "Managed account auth data does not contain complete ChatGPT account information: \(message)"
         case .unauthorized:
-            return "Codex OAuth token expired or was rejected. Sign in with Codex again, or switch Settings to CLI RPC."
+            return "Managed account OAuth token expired or was rejected. Add the account again in Settings."
         case .invalidResponse:
             return "Invalid response from the Codex OAuth usage API."
         case .decodeFailed(let message):
