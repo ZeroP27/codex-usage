@@ -59,6 +59,11 @@ final class CodexUsageStore: ObservableObject {
         case manualAccount
     }
 
+    private enum AccountUsageCredentialSource {
+        case managedSnapshot
+        case activeAuthReadOnly
+    }
+
     private static let usageDataSourceDefaultsKey = "usageDataSource"
     private static let refreshIntervalDefaultsKey = "refreshInterval"
     private static let codexExecutableDefaultsKey = "codexExecutablePath"
@@ -128,11 +133,11 @@ final class CodexUsageStore: ObservableObject {
     }
 
     private func refreshCurrentAccount(trigger: RefreshTrigger) {
+        if usageDataSource == .oauthAPI {
+            refreshStoredCurrentAccount(trigger: trigger)
+            return
+        }
         guard let accountKey = currentAccountKey else {
-            if usageDataSource == .oauthAPI {
-                refreshStoredCurrentAccount(trigger: trigger)
-                return
-            }
             if usageDataSource == .cliRPC {
                 refresh(trigger: trigger)
                 return
@@ -556,7 +561,8 @@ final class CodexUsageStore: ObservableObject {
 
     nonisolated private static func loadManagedAccountsUsage() async throws -> UsageLoadResult {
         let accountStore = CodexUsageAccountStore()
-        let registry = try accountStore.loadSnapshot()
+        var activeAccountKey = try accountStore.managedAccountKeyForActiveAuth()
+        let registry = try accountStore.loadSnapshot(markingActiveAccountKey: activeAccountKey)
         guard !registry.accounts.isEmpty else {
             throw CodexUsageAccountStoreError.noManagedAccounts
         }
@@ -566,23 +572,34 @@ final class CodexUsageStore: ObservableObject {
         let usageClient = CodexOAuthUsageClient()
 
         for account in registry.accounts {
+            activeAccountKey = try accountStore.managedAccountKeyForActiveAuth()
+            guard account.accountKey != activeAccountKey else {
+                Self.backgroundLogger.info("managed account batch refresh skipped current account key_fp=\(LogFingerprint.account(account.accountKey), privacy: .public) key=\(account.accountKey, privacy: .private)")
+                rows.append(Self.storedRow(for: account))
+                continue
+            }
+
             rows.append(
                 await Self.loadManagedAccountRow(
                     account: account,
                     accountStore: accountStore,
-                    usageClient: usageClient
+                    usageClient: usageClient,
+                    credentialSource: .managedSnapshot
                 )
             )
         }
 
-        return UsageLoadResult(rows: rows, activeAccountKey: registry.activeAccountKey)
+        activeAccountKey = try accountStore.managedAccountKeyForActiveAuth()
+        rows = Self.markRows(rows, activeAccountKey: activeAccountKey)
+        return UsageLoadResult(rows: rows, activeAccountKey: activeAccountKey)
     }
 
     nonisolated private static func loadManagedAccountsUsage(
         accountKey: String
     ) async throws -> SingleAccountUsageLoadResult {
         let accountStore = CodexUsageAccountStore()
-        let registry = try accountStore.loadSnapshot()
+        let activeAccountKey = try accountStore.managedAccountKeyForActiveAuth()
+        let registry = try accountStore.loadSnapshot(markingActiveAccountKey: activeAccountKey)
         guard let account = registry.accounts.first(where: { $0.accountKey == accountKey }) else {
             throw CodexUsageAccountStoreError.accountNotFound
         }
@@ -591,21 +608,25 @@ final class CodexUsageStore: ObservableObject {
         let row = await Self.loadManagedAccountRow(
             account: account,
             accountStore: accountStore,
-            usageClient: usageClient
+            usageClient: usageClient,
+            credentialSource: account.accountKey == activeAccountKey
+                ? .activeAuthReadOnly
+                : .managedSnapshot
         )
-        return SingleAccountUsageLoadResult(row: row, activeAccountKey: registry.activeAccountKey)
+        return SingleAccountUsageLoadResult(row: row, activeAccountKey: activeAccountKey)
     }
 
     nonisolated private static func loadCurrentManagedAccountUsage() async throws -> UsageLoadResult {
         let accountStore = CodexUsageAccountStore()
-        let registry = try accountStore.loadSnapshot()
+        let activeAccountKey = try accountStore.managedAccountKeyForActiveAuth()
+        let registry = try accountStore.loadSnapshot(markingActiveAccountKey: activeAccountKey)
         guard !registry.accounts.isEmpty else {
             throw CodexUsageAccountStoreError.noManagedAccounts
         }
 
         var result = Self.storedRows(from: registry)
-        guard let activeAccountKey = registry.activeAccountKey else {
-            result.errorMessage = "No current managed account is selected. Choose an account from Accounts."
+        guard let activeAccountKey else {
+            result.errorMessage = "Current Codex auth is not one of the managed accounts. Switch to a managed account or add the current Codex account."
             return result
         }
 
@@ -620,7 +641,8 @@ final class CodexUsageStore: ObservableObject {
         let refreshedRow = await Self.loadManagedAccountRow(
             account: account,
             accountStore: accountStore,
-            usageClient: usageClient
+            usageClient: usageClient,
+            credentialSource: .activeAuthReadOnly
         )
         if let index = result.rows.firstIndex(where: { $0.id == refreshedRow.id }) {
             result.rows[index] = refreshedRow
@@ -639,15 +661,11 @@ final class CodexUsageStore: ObservableObject {
     nonisolated private static func loadManagedAccountRow(
         account: CodexManagedAccount,
         accountStore: CodexUsageAccountStore,
-        usageClient: CodexOAuthUsageClient
+        usageClient: CodexOAuthUsageClient,
+        credentialSource: AccountUsageCredentialSource
     ) async -> AccountUsageRow {
-        let storedSnapshot = account.storedUsage ?? UsageSnapshot(
-            account: account.codexAccount,
-            sessionWindow: nil,
-            weeklyWindow: nil,
-            updatedAt: account.lastUsageAt,
-            sourceDescription: "Stored account"
-        )
+        let storedRow = Self.storedRow(for: account)
+        let storedSnapshot = storedRow.snapshot
 
         guard account.authMode == nil || account.authMode == "chatgpt" else {
             return AccountUsageRow(
@@ -659,13 +677,28 @@ final class CodexUsageStore: ObservableObject {
         }
 
         do {
-            let authFileURL = try accountStore.authFileURL(for: account.accountKey)
-            let snapshot = try await usageClient.loadSnapshot(
-                authFileURL: authFileURL,
-                managedAccount: account,
-                activeAuthFileURL: accountStore.activeAuthFileURL
-            )
-            let updatedAccount = try accountStore.updateUsage(accountKey: account.accountKey, snapshot: snapshot)
+            let snapshot: UsageSnapshot
+            switch credentialSource {
+            case .managedSnapshot:
+                if try accountStore.managedAccountKeyForActiveAuth() == account.accountKey {
+                    var currentAccount = account
+                    currentAccount.isActive = true
+                    Self.backgroundLogger.info("managed account row refresh skipped because account became current key_fp=\(LogFingerprint.account(account.accountKey), privacy: .public) key=\(account.accountKey, privacy: .private)")
+                    return Self.storedRow(for: currentAccount)
+                }
+                let authFileURL = try accountStore.authFileURL(for: account.accountKey)
+                snapshot = try await usageClient.loadSnapshot(
+                    authFileURL: authFileURL,
+                    managedAccount: account
+                )
+            case .activeAuthReadOnly:
+                snapshot = try await usageClient.loadSnapshotReadOnly(
+                    authFileURL: accountStore.activeAuthFileURL,
+                    managedAccount: account
+                )
+            }
+            var updatedAccount = try accountStore.updateUsage(accountKey: account.accountKey, snapshot: snapshot)
+            updatedAccount.isActive = account.isActive
             return AccountUsageRow(
                 account: updatedAccount,
                 snapshot: snapshot,
@@ -673,11 +706,12 @@ final class CodexUsageStore: ObservableObject {
                 isRefreshing: false
             )
         } catch {
-            Self.backgroundLogger.error("managed account row refresh failed key_fp=\(LogFingerprint.account(account.accountKey), privacy: .public) account_id_fp=\(LogFingerprint.account(account.chatgptAccountID), privacy: .public) is_active=\(account.isActive, privacy: .public) error_type=\(LogErrorSummary.category(error), privacy: .public) error=\(error.localizedDescription, privacy: .private)")
+            let errorMessage = Self.accountUsageErrorMessage(error, credentialSource: credentialSource)
+            Self.backgroundLogger.error("managed account row refresh failed key_fp=\(LogFingerprint.account(account.accountKey), privacy: .public) account_id_fp=\(LogFingerprint.account(account.chatgptAccountID), privacy: .public) is_active=\(account.isActive, privacy: .public) read_only=\((credentialSource == .activeAuthReadOnly), privacy: .public) error_type=\(LogErrorSummary.category(error), privacy: .public) error=\(error.localizedDescription, privacy: .private)")
             return AccountUsageRow(
                 account: account,
                 snapshot: storedSnapshot,
-                errorMessage: error.localizedDescription,
+                errorMessage: errorMessage,
                 isRefreshing: false
             )
         }
@@ -712,21 +746,46 @@ final class CodexUsageStore: ObservableObject {
     }
 
     nonisolated private static func storedRows(from snapshot: CodexManagedAccountsSnapshot) -> UsageLoadResult {
-        let rows = snapshot.accounts.map { account in
-            AccountUsageRow(
-                account: account,
-                snapshot: account.storedUsage ?? UsageSnapshot(
-                    account: account.codexAccount,
-                    sessionWindow: nil,
-                    weeklyWindow: nil,
-                    updatedAt: account.lastUsageAt,
-                    sourceDescription: "Stored account"
-                ),
-                errorMessage: nil,
-                isRefreshing: false
-            )
-        }
+        let rows = snapshot.accounts.map(Self.storedRow(for:))
         return UsageLoadResult(rows: rows, activeAccountKey: snapshot.activeAccountKey)
+    }
+
+    nonisolated private static func storedRow(for account: CodexManagedAccount) -> AccountUsageRow {
+        AccountUsageRow(
+            account: account,
+            snapshot: account.storedUsage ?? UsageSnapshot(
+                account: account.codexAccount,
+                sessionWindow: nil,
+                weeklyWindow: nil,
+                updatedAt: account.lastUsageAt,
+                sourceDescription: "Stored account"
+            ),
+            errorMessage: nil,
+            isRefreshing: false
+        )
+    }
+
+    nonisolated private static func markRows(
+        _ rows: [AccountUsageRow],
+        activeAccountKey: String?
+    ) -> [AccountUsageRow] {
+        rows.map { row in
+            var next = row
+            next.account.isActive = next.id == activeAccountKey
+            return next
+        }
+    }
+
+    nonisolated private static func accountUsageErrorMessage(
+        _ error: Error,
+        credentialSource: AccountUsageCredentialSource
+    ) -> String {
+        if credentialSource == .activeAuthReadOnly,
+           case CodexOAuthUsageError.unauthorized = error
+        {
+            return "Current Codex auth token was rejected. Use Codex to refresh the current login, then refresh quota again."
+        }
+        return error.localizedDescription
     }
 
     nonisolated private static func loadCLISnapshot(codexExecutablePath: String) async throws -> UsageSnapshot {

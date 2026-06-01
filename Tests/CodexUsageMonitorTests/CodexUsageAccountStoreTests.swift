@@ -80,6 +80,185 @@ struct CodexUsageAccountStoreTests {
     }
 
     @Test
+    func testCaptureActiveAuthStoresActiveSnapshot() throws {
+        let fixture = try makeStoreFixture()
+        defer { fixture.cleanup() }
+        let oldAuthData = try makeAuthData(
+            email: "first@example.com",
+            userID: "user-1",
+            accountID: "account-1",
+            planType: "plus",
+            accessToken: "access-old",
+            refreshToken: "refresh-old",
+            lastRefresh: "2026-01-01T00:00:00Z"
+        )
+        let newAuthData = try makeAuthData(
+            email: "first@example.com",
+            userID: "user-1",
+            accountID: "account-1",
+            planType: "plus",
+            accessToken: "access-new",
+            refreshToken: "refresh-new",
+            lastRefresh: "2026-01-02T00:00:00Z"
+        )
+
+        let account = try fixture.store.addAccount(authData: oldAuthData)
+        try newAuthData.write(to: fixture.store.activeAuthFileURL, options: .atomic)
+
+        let capturedAccountKey = try fixture.store.captureActiveAuthToManagedSnapshot()
+
+        #expect(capturedAccountKey == account.accountKey)
+        #expect(try Data(contentsOf: try fixture.store.authFileURL(for: account.accountKey)) == newAuthData)
+    }
+
+    @Test
+    func testCaptureActiveAuthUsesActiveSnapshotAsSourceOfTruth() throws {
+        let fixture = try makeStoreFixture()
+        defer { fixture.cleanup() }
+        let oldAuthData = try makeAuthData(
+            email: "first@example.com",
+            userID: "user-1",
+            accountID: "account-1",
+            planType: "plus",
+            accessToken: "access-old",
+            refreshToken: "refresh-old",
+            lastRefresh: "2026-01-01T00:00:00Z"
+        )
+        let newAuthData = try makeAuthData(
+            email: "first@example.com",
+            userID: "user-1",
+            accountID: "account-1",
+            planType: "plus",
+            accessToken: "access-new",
+            refreshToken: "refresh-new",
+            lastRefresh: "2026-01-02T00:00:00Z"
+        )
+
+        let account = try fixture.store.addAccount(authData: newAuthData)
+        try oldAuthData.write(to: fixture.store.activeAuthFileURL, options: .atomic)
+
+        let capturedAccountKey = try fixture.store.captureActiveAuthToManagedSnapshot()
+
+        #expect(capturedAccountKey == account.accountKey)
+        #expect(try Data(contentsOf: try fixture.store.authFileURL(for: account.accountKey)) == oldAuthData)
+    }
+
+    @Test
+    func testManagedAccountKeyForActiveAuthUsesAuthJsonInsteadOfRegistryActiveKey() throws {
+        let fixture = try makeStoreFixture()
+        defer { fixture.cleanup() }
+        let firstAuthData = try makeAuthData(
+            email: "first@example.com",
+            userID: "user-1",
+            accountID: "account-1",
+            planType: "plus"
+        )
+        let secondAuthData = try makeAuthData(
+            email: "second@example.com",
+            userID: "user-2",
+            accountID: "account-2",
+            planType: "pro"
+        )
+
+        let first = try fixture.store.addAccount(authData: firstAuthData)
+        let second = try fixture.store.addAccount(authData: secondAuthData)
+        try firstAuthData.write(to: fixture.store.activeAuthFileURL, options: .atomic)
+
+        let activeAccountKey = try fixture.store.managedAccountKeyForActiveAuth()
+        let snapshot = try fixture.store.loadSnapshot(markingActiveAccountKey: activeAccountKey)
+
+        #expect(second.isActive)
+        #expect(activeAccountKey == first.accountKey)
+        #expect(snapshot.activeAccountKey == first.accountKey)
+        #expect(snapshot.accounts.first(where: { $0.accountKey == first.accountKey })?.isActive == true)
+        #expect(snapshot.accounts.first(where: { $0.accountKey == second.accountKey })?.isActive == false)
+    }
+
+    @Test
+    func testActivateAccountPreservesExternallyRefreshedActiveSnapshotBeforeSwitching() throws {
+        let fixture = try makeStoreFixture()
+        defer { fixture.cleanup() }
+        let firstOldAuthData = try makeAuthData(
+            email: "first@example.com",
+            userID: "user-1",
+            accountID: "account-1",
+            planType: "plus",
+            accessToken: "access-first-old",
+            refreshToken: "refresh-first-old",
+            lastRefresh: "2026-01-01T00:00:00Z"
+        )
+        let firstNewAuthData = try makeAuthData(
+            email: "first@example.com",
+            userID: "user-1",
+            accountID: "account-1",
+            planType: "plus",
+            accessToken: "access-first-new",
+            refreshToken: "refresh-first-new",
+            lastRefresh: "2026-01-02T00:00:00Z"
+        )
+        let secondAuthData = try makeAuthData(
+            email: "second@example.com",
+            userID: "user-2",
+            accountID: "account-2",
+            planType: "pro",
+            accessToken: "access-second",
+            refreshToken: "refresh-second",
+            lastRefresh: "2026-01-01T12:00:00Z"
+        )
+
+        let first = try fixture.store.addAccount(authData: firstOldAuthData)
+        let second = try fixture.store.addAccount(authData: secondAuthData)
+        try fixture.store.activateAccount(accountKey: first.accountKey)
+        try firstNewAuthData.write(to: fixture.store.activeAuthFileURL, options: .atomic)
+
+        try fixture.store.activateAccount(accountKey: second.accountKey)
+
+        #expect(try Data(contentsOf: try fixture.store.authFileURL(for: first.accountKey)) == firstNewAuthData)
+        #expect(try Data(contentsOf: fixture.store.activeAuthFileURL) == secondAuthData)
+    }
+
+    @Test
+    func testAddAccountPreservesExternallyRefreshedActiveSnapshotBeforeSwitching() throws {
+        let fixture = try makeStoreFixture()
+        defer { fixture.cleanup() }
+        let firstOldAuthData = try makeAuthData(
+            email: "first@example.com",
+            userID: "user-1",
+            accountID: "account-1",
+            planType: "plus",
+            accessToken: "access-first-old",
+            refreshToken: "refresh-first-old",
+            lastRefresh: "2026-01-01T00:00:00Z"
+        )
+        let firstNewAuthData = try makeAuthData(
+            email: "first@example.com",
+            userID: "user-1",
+            accountID: "account-1",
+            planType: "plus",
+            accessToken: "access-first-new",
+            refreshToken: "refresh-first-new",
+            lastRefresh: "2026-01-02T00:00:00Z"
+        )
+        let secondAuthData = try makeAuthData(
+            email: "second@example.com",
+            userID: "user-2",
+            accountID: "account-2",
+            planType: "pro",
+            accessToken: "access-second",
+            refreshToken: "refresh-second",
+            lastRefresh: "2026-01-01T12:00:00Z"
+        )
+
+        let first = try fixture.store.addAccount(authData: firstOldAuthData)
+        try firstNewAuthData.write(to: fixture.store.activeAuthFileURL, options: .atomic)
+
+        _ = try fixture.store.addAccount(authData: secondAuthData)
+
+        #expect(try Data(contentsOf: try fixture.store.authFileURL(for: first.accountKey)) == firstNewAuthData)
+        #expect(try Data(contentsOf: fixture.store.activeAuthFileURL) == secondAuthData)
+    }
+
+    @Test
     func testRemoveAccountRejectsActiveAccountBeforeDeletingFiles() throws {
         let fixture = try makeStoreFixture()
         defer { fixture.cleanup() }
@@ -115,6 +294,39 @@ struct CodexUsageAccountStoreTests {
         ))
         #expect(FileManager.default.fileExists(
             atPath: try fixture.store.authFileURL(for: second.accountKey).path
+        ))
+    }
+
+    @Test
+    func testRemoveAccountRejectsActiveAuthAccountWhenRegistryActiveKeyDiffers() throws {
+        let fixture = try makeStoreFixture()
+        defer { fixture.cleanup() }
+        let firstAuthData = try makeAuthData(
+            email: "first@example.com",
+            userID: "user-1",
+            accountID: "account-1",
+            planType: "plus"
+        )
+        let secondAuthData = try makeAuthData(
+            email: "second@example.com",
+            userID: "user-2",
+            accountID: "account-2",
+            planType: "pro"
+        )
+        let first = try fixture.store.addAccount(authData: firstAuthData)
+        _ = try fixture.store.addAccount(authData: secondAuthData)
+        try firstAuthData.write(to: fixture.store.activeAuthFileURL, options: .atomic)
+
+        do {
+            _ = try fixture.store.removeAccount(accountKey: first.accountKey)
+            #expect(Bool(false), "Expected activeAccountCannotBeRemoved")
+        } catch CodexUsageAccountStoreError.activeAccountCannotBeRemoved {
+        } catch {
+            #expect(Bool(false), "Expected activeAccountCannotBeRemoved, got \(error)")
+        }
+
+        #expect(FileManager.default.fileExists(
+            atPath: try fixture.store.authFileURL(for: first.accountKey).path
         ))
     }
 
@@ -204,7 +416,10 @@ struct CodexUsageAccountStoreTests {
         email: String,
         userID: String,
         accountID: String,
-        planType: String
+        planType: String,
+        accessToken: String? = nil,
+        refreshToken: String? = nil,
+        lastRefresh: String? = nil
     ) throws -> Data {
         let idToken = try makeJWT(payload: [
             "email": email,
@@ -214,14 +429,17 @@ struct CodexUsageAccountStoreTests {
                 "chatgpt_plan_type": planType
             ]
         ])
-        let json: [String: Any] = [
+        var json: [String: Any] = [
             "tokens": [
-                "access_token": "access-\(userID)",
-                "refresh_token": "refresh-\(userID)",
+                "access_token": accessToken ?? "access-\(userID)",
+                "refresh_token": refreshToken ?? "refresh-\(userID)",
                 "id_token": idToken,
                 "account_id": accountID
             ]
         ]
+        if let lastRefresh {
+            json["last_refresh"] = lastRefresh
+        }
         return try JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted])
     }
 

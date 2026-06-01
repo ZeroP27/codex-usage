@@ -7,6 +7,7 @@ struct CodexAppServerClient {
     var executablePath: String
     var timeout: TimeInterval = 15
     var loginTimeout: TimeInterval = 300
+    private static let clientVersion = "0.3.1"
     private static let logger = Logger(
         subsystem: "dev.idea-space.CodexUsageMonitor",
         category: "AppServer"
@@ -50,7 +51,7 @@ struct CodexAppServerClient {
                 "clientInfo": [
                     "name": "codex_usage_monitor",
                     "title": "Codex Usage",
-                    "version": "0.1.0"
+                    "version": Self.clientVersion
                 ]
             ],
             timeout: timeout
@@ -154,7 +155,7 @@ struct CodexAppServerClient {
                 "clientInfo": [
                     "name": "codex_usage_monitor",
                     "title": "Codex Usage",
-                    "version": "0.1.0"
+                    "version": Self.clientVersion
                 ]
             ],
             timeout: timeout

@@ -10,23 +10,19 @@ struct CodexOAuthUsageClient {
 
     func loadSnapshot(
         authFileURL: URL? = nil,
-        managedAccount: CodexManagedAccount? = nil,
-        activeAuthFileURL: URL? = nil
+        managedAccount: CodexManagedAccount? = nil
     ) async throws -> UsageSnapshot {
         let authFileURL = authFileURL ?? CodexOAuthCredentialsStore.authFileURL
         var credentials = try CodexOAuthCredentialsStore.load(
             from: authFileURL,
             fallbackAccountID: managedAccount?.chatgptAccountID
         )
+        try Self.validateCredentials(credentials, match: managedAccount)
 
         if credentials.shouldRefreshBeforeUse {
             credentials = try await CodexOAuthTokenRefresher.refresh(credentials, timeout: timeout)
+            try Self.validateCredentials(credentials, match: managedAccount)
             try CodexOAuthCredentialsStore.save(credentials, to: authFileURL)
-            try syncActiveAuthIfNeeded(
-                authFileURL: authFileURL,
-                managedAccount: managedAccount,
-                activeAuthFileURL: activeAuthFileURL
-            )
             Self.logger.info("refreshed token before usage key=\(managedAccount?.accountKey ?? "active", privacy: .private)")
         }
 
@@ -39,18 +35,47 @@ struct CodexOAuthUsageClient {
             )
         } catch CodexOAuthUsageError.unauthorized where !credentials.refreshToken.isEmpty {
             credentials = try await CodexOAuthTokenRefresher.refresh(credentials, timeout: timeout)
+            try Self.validateCredentials(credentials, match: managedAccount)
             try CodexOAuthCredentialsStore.save(credentials, to: authFileURL)
-            try syncActiveAuthIfNeeded(
-                authFileURL: authFileURL,
-                managedAccount: managedAccount,
-                activeAuthFileURL: activeAuthFileURL
-            )
             Self.logger.info("refreshed token after unauthorized key=\(managedAccount?.accountKey ?? "active", privacy: .private)")
             let response = try await fetchUsage(credentials: credentials)
             return try Self.makeSnapshot(
                 response: response,
                 credentials: credentials,
                 managedAccount: managedAccount
+            )
+        }
+    }
+
+    func loadSnapshotReadOnly(
+        authFileURL: URL? = nil,
+        managedAccount: CodexManagedAccount? = nil
+    ) async throws -> UsageSnapshot {
+        let authFileURL = authFileURL ?? CodexOAuthCredentialsStore.authFileURL
+        let credentials = try CodexOAuthCredentialsStore.load(
+            from: authFileURL,
+            fallbackAccountID: managedAccount?.chatgptAccountID
+        )
+        try Self.validateCredentials(credentials, match: managedAccount)
+        Self.logger.info("loading read-only oauth usage key=\(managedAccount?.accountKey ?? "active", privacy: .private)")
+        let response = try await fetchUsage(credentials: credentials)
+        return try Self.makeSnapshot(
+            response: response,
+            credentials: credentials,
+            managedAccount: managedAccount
+        )
+    }
+
+    private static func validateCredentials(
+        _ credentials: CodexOAuthCredentials,
+        match managedAccount: CodexManagedAccount?
+    ) throws {
+        guard let managedAccount else { return }
+        let accountInfo = try credentials.accountInfo()
+        guard accountInfo.accountKey == managedAccount.accountKey else {
+            throw CodexOAuthUsageError.accountMismatch(
+                expected: managedAccount.accountKey,
+                actual: accountInfo.accountKey
             )
         }
     }
@@ -165,21 +190,6 @@ struct CodexOAuthUsageClient {
             weeklyWindow: weekly,
             updatedAt: Date(),
             sourceDescription: CodexUsageDataSource.oauthAPI.title
-        )
-    }
-
-    private func syncActiveAuthIfNeeded(
-        authFileURL: URL,
-        managedAccount: CodexManagedAccount?,
-        activeAuthFileURL: URL?
-    ) throws {
-        guard let managedAccount, let activeAuthFileURL else { return }
-        let accountStore = CodexUsageAccountStore(
-            codexHomeURL: activeAuthFileURL.deletingLastPathComponent()
-        )
-        try accountStore.syncActiveAuthIfAccountIsActive(
-            accountKey: managedAccount.accountKey,
-            authFileURL: authFileURL
         )
     }
 
@@ -645,6 +655,7 @@ enum CodexOAuthUsageError: LocalizedError {
     case serverError(Int, String?)
     case networkError(Error)
     case missingRateLimitData
+    case accountMismatch(expected: String, actual: String)
 
     var errorDescription: String? {
         switch self {
@@ -669,6 +680,8 @@ enum CodexOAuthUsageError: LocalizedError {
             return "Network error while reading Codex OAuth usage: \(error.localizedDescription)"
         case .missingRateLimitData:
             return "Codex OAuth API did not return rate limit data."
+        case .accountMismatch:
+            return "Codex OAuth auth data belongs to a different managed account."
         }
     }
 }

@@ -60,13 +60,16 @@ The account registry is `registry.json`; each account auth snapshot is stored as
 permissions. The app does not read or write `~/.codex/accounts`.
 
 The app does not auto-switch accounts when a quota threshold is reached. Account
-switching is manual: choosing an account copies the chosen account snapshot into
-`~/.codex/auth.json` and updates the active account in the Codex Usage registry.
+switching is manual: choosing an account first captures the current
+`~/.codex/auth.json` back into its managed snapshot when it belongs to a managed
+account, then copies the chosen account snapshot into `~/.codex/auth.json` and
+updates the active account in the Codex Usage registry.
 
 Configured auto-refresh intervals are jittered around the selected interval
 instead of firing at an exact fixed cadence. Automatic and stale menu refreshes
-refresh the current active account only. The Accounts panel can manually refresh
-individual accounts or all managed accounts.
+read quota for the current active account without modifying `~/.codex/auth.json`.
+The Accounts panel can manually refresh individual accounts or all managed
+accounts. All-account refresh skips the current active account.
 
 CLI RPC is available from Settings. That mode starts a local
 `codex app-server --listen stdio://` process and reads rate-limit data through
@@ -78,8 +81,8 @@ Codex Usage stores managed account credentials as local JSON files under its
 Application Support directory. It uses those tokens to call ChatGPT/OpenAI usage
 and OAuth refresh endpoints. When tokens are refreshed, the app writes them back
 to the specific managed account snapshot being refreshed with owner-only
-permissions. It syncs `~/.codex/auth.json` only when switching accounts or when
-the refreshed account is the current active account.
+permissions. It syncs `~/.codex/auth.json` only when switching accounts or
+adding a managed account. Quota refreshes do not write `~/.codex/auth.json`.
 
 The app does not use Keychain for managed accounts and does not depend on
 codex-auth.

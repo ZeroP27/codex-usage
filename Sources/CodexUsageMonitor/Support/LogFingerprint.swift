@@ -46,6 +46,8 @@ enum LogErrorSummary {
             return "oauth_network_\(nsError.domain)#\(nsError.code)"
         case .missingRateLimitData:
             return "oauth_missing_rate_limit_data"
+        case .accountMismatch:
+            return "oauth_account_mismatch"
         }
     }
 

@@ -26,7 +26,18 @@ struct CodexUsageAccountStore {
 
     func loadSnapshot() throws -> CodexManagedAccountsSnapshot {
         let registry = try loadRegistryFile()
-        let activeAccountKey = registry.activeAccountKey
+        return makeSnapshot(from: registry, activeAccountKey: registry.activeAccountKey)
+    }
+
+    func loadSnapshot(markingActiveAccountKey activeAccountKey: String?) throws -> CodexManagedAccountsSnapshot {
+        let registry = try loadRegistryFile()
+        return makeSnapshot(from: registry, activeAccountKey: activeAccountKey)
+    }
+
+    private func makeSnapshot(
+        from registry: ManagedAccountsRegistryFile,
+        activeAccountKey: String?
+    ) -> CodexManagedAccountsSnapshot {
         let accounts = registry.accounts.map {
             $0.managedAccount(activeAccountKey: activeAccountKey)
         }
@@ -49,6 +60,8 @@ struct CodexUsageAccountStore {
         let accountInfo = try credentials.accountInfo()
         let destinationURL = try self.authFileURL(for: accountInfo.accountKey)
         Self.logger.info("importing managed account key_fp=\(LogFingerprint.account(accountInfo.accountKey), privacy: .public) account_id_fp=\(LogFingerprint.account(accountInfo.chatgptAccountID), privacy: .public) key=\(accountInfo.accountKey, privacy: .private) email=\(accountInfo.email, privacy: .private) plan=\(accountInfo.planType ?? "missing", privacy: .public) account_id_source=\(accountInfo.accountIDSource, privacy: .public)")
+
+        _ = try captureActiveAuthToManagedSnapshot()
 
         try ensureAccountsDirectory()
         let previousSnapshotData = try authSnapshotDataIfExists(at: destinationURL)
@@ -102,7 +115,8 @@ struct CodexUsageAccountStore {
         guard registry.accounts.contains(where: { $0.accountKey == accountKey }) else {
             throw CodexUsageAccountStoreError.accountNotFound
         }
-        guard registry.activeAccountKey != accountKey else {
+        let activeAuthAccountKey = try managedAccountKeyForActiveAuth()
+        guard registry.activeAccountKey != accountKey && activeAuthAccountKey != accountKey else {
             throw CodexUsageAccountStoreError.activeAccountCannotBeRemoved
         }
 
@@ -137,6 +151,8 @@ struct CodexUsageAccountStore {
             throw CodexUsageAccountStoreError.accountNotFound
         }
 
+        _ = try captureActiveAuthToManagedSnapshot()
+
         let sourceAuthURL = try authFileURL(for: accountKey)
         guard FileManager.default.fileExists(atPath: sourceAuthURL.path) else {
             throw CodexUsageAccountStoreError.authSnapshotNotFound(sourceAuthURL.path)
@@ -154,14 +170,72 @@ struct CodexUsageAccountStore {
         Self.logger.info("activated managed account key_fp=\(LogFingerprint.account(accountKey), privacy: .public) key=\(accountKey, privacy: .private)")
     }
 
-    func syncActiveAuthIfAccountIsActive(accountKey: String, authFileURL: URL) throws {
-        let registry = try loadRegistryFile()
-        guard registry.activeAccountKey == accountKey else {
-            Self.logger.info("skipped active auth sync for non-active account key_fp=\(LogFingerprint.account(accountKey), privacy: .public) key=\(accountKey, privacy: .private)")
-            return
+    @discardableResult
+    func captureActiveAuthToManagedSnapshot(expectedAccountKey: String? = nil) throws -> String? {
+        guard FileManager.default.fileExists(atPath: activeAuthFileURL.path) else {
+            Self.logger.info("active auth capture skipped reason=missing_active_auth expected_fp=\(LogFingerprint.account(expectedAccountKey), privacy: .public)")
+            return nil
         }
-        try replaceActiveAuth(with: authFileURL)
-        Self.logger.info("synced refreshed active auth key_fp=\(LogFingerprint.account(accountKey), privacy: .public) key=\(accountKey, privacy: .private)")
+
+        let activeData = try Data(contentsOf: activeAuthFileURL)
+        let activeAccountInfo: CodexOAuthAccountInfo
+        do {
+            let activeCredentials = try CodexOAuthCredentialsStore.load(from: activeData)
+            activeAccountInfo = try activeCredentials.accountInfo()
+        } catch {
+            Self.logger.info("active auth capture skipped reason=unreadable_active_auth expected_fp=\(LogFingerprint.account(expectedAccountKey), privacy: .public) error_type=\(LogErrorSummary.category(error), privacy: .public) error=\(error.localizedDescription, privacy: .private)")
+            return nil
+        }
+
+        if let expectedAccountKey, activeAccountInfo.accountKey != expectedAccountKey {
+            Self.logger.info("active auth capture skipped reason=unexpected_account expected_fp=\(LogFingerprint.account(expectedAccountKey), privacy: .public) active_fp=\(LogFingerprint.account(activeAccountInfo.accountKey), privacy: .public) expected=\(expectedAccountKey, privacy: .private) active=\(activeAccountInfo.accountKey, privacy: .private)")
+            return nil
+        }
+
+        let registry = try loadRegistryFile()
+        guard registry.accounts.contains(where: { $0.accountKey == activeAccountInfo.accountKey }) else {
+            Self.logger.info("active auth capture skipped reason=unmanaged_account active_fp=\(LogFingerprint.account(activeAccountInfo.accountKey), privacy: .public) active=\(activeAccountInfo.accountKey, privacy: .private)")
+            return nil
+        }
+
+        let managedAuthURL = try authFileURL(for: activeAccountInfo.accountKey)
+        if let managedData = try authSnapshotDataIfExists(at: managedAuthURL),
+           managedData == activeData
+        {
+            Self.logger.info("active auth capture skipped reason=identical_snapshot active_fp=\(LogFingerprint.account(activeAccountInfo.accountKey), privacy: .public) active=\(activeAccountInfo.accountKey, privacy: .private)")
+            return activeAccountInfo.accountKey
+        }
+
+        try ensureAccountsDirectory()
+        try activeData.write(to: managedAuthURL, options: .atomic)
+        try Self.setOwnerOnlyPermissions(managedAuthURL)
+        Self.logger.info("active auth captured into managed snapshot active_fp=\(LogFingerprint.account(activeAccountInfo.accountKey), privacy: .public) active=\(activeAccountInfo.accountKey, privacy: .private)")
+        return activeAccountInfo.accountKey
+    }
+
+    func managedAccountKeyForActiveAuth() throws -> String? {
+        guard FileManager.default.fileExists(atPath: activeAuthFileURL.path) else {
+            Self.logger.info("active auth account lookup skipped reason=missing_active_auth")
+            return nil
+        }
+
+        let activeData = try Data(contentsOf: activeAuthFileURL)
+        let activeAccountInfo: CodexOAuthAccountInfo
+        do {
+            activeAccountInfo = try CodexOAuthCredentialsStore.load(from: activeData).accountInfo()
+        } catch {
+            Self.logger.info("active auth account lookup skipped reason=unreadable_active_auth error_type=\(LogErrorSummary.category(error), privacy: .public) error=\(error.localizedDescription, privacy: .private)")
+            return nil
+        }
+
+        let registry = try loadRegistryFile()
+        guard registry.accounts.contains(where: { $0.accountKey == activeAccountInfo.accountKey }) else {
+            Self.logger.info("active auth account lookup skipped reason=unmanaged_account active_fp=\(LogFingerprint.account(activeAccountInfo.accountKey), privacy: .public) active=\(activeAccountInfo.accountKey, privacy: .private)")
+            return nil
+        }
+
+        Self.logger.info("active auth account resolved active_fp=\(LogFingerprint.account(activeAccountInfo.accountKey), privacy: .public) active=\(activeAccountInfo.accountKey, privacy: .private)")
+        return activeAccountInfo.accountKey
     }
 
     func updateUsage(accountKey: String, snapshot: UsageSnapshot) throws -> CodexManagedAccount {
