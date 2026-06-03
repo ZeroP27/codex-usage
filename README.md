@@ -15,6 +15,7 @@ The menu bar view shows:
 - macOS 14 or later
 - Swift 6 toolchain or Xcode Command Line Tools
 - Codex CLI available for adding accounts through `codex app-server`
+- Google Chrome for managed account login, opened in an incognito window
 
 ## Build And Run
 
@@ -48,8 +49,8 @@ Release notes list commit-derived changes, download names, and SHA-256 checksums
 
 Codex Usage uses the Managed Accounts source by default. Accounts are added from
 Settings. The app starts `codex app-server --listen stdio://` with a temporary
-`CODEX_HOME`, opens the ChatGPT login URL returned by Codex, and stores the
-resulting auth snapshot under:
+`CODEX_HOME`, opens the ChatGPT login URL in a Google Chrome incognito window,
+and stores the resulting auth snapshot under:
 
 ```text
 ~/Library/Application Support/Codex Usage/accounts/

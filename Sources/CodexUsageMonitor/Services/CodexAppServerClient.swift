@@ -8,6 +8,8 @@ struct CodexAppServerClient {
     var timeout: TimeInterval = 15
     var loginTimeout: TimeInterval = 300
     private static let clientVersion = "0.3.1"
+    private static let chromeBundleIdentifier = "com.google.Chrome"
+    private static let openToolURL = URL(fileURLWithPath: "/usr/bin/open")
     private static let logger = Logger(
         subsystem: "dev.idea-space.CodexUsageMonitor",
         category: "AppServer"
@@ -187,11 +189,13 @@ struct CodexAppServerClient {
             throw CodexAppServerError.loginFailed("codex app-server returned an unexpected login URL host.")
         }
 
-        guard Self.openAuthenticationURL(authURL) else {
-            Self.logger.error("chatgpt login failed to open auth_url_host=\(authURL.host ?? "missing", privacy: .public)")
-            throw CodexAppServerError.loginFailed("Could not open the ChatGPT login URL.")
+        do {
+            try Self.openAuthenticationURL(authURL)
+        } catch {
+            Self.logger.error("chatgpt login failed to open chrome incognito auth_url_host=\(authURL.host ?? "missing", privacy: .public) error_type=\(LogErrorSummary.category(error), privacy: .public) error=\(error.localizedDescription, privacy: .private)")
+            throw error
         }
-        Self.logger.info("chatgpt login opened auth_url_host=\(authURL.host ?? "missing", privacy: .public)")
+        Self.logger.info("chatgpt login opened chrome incognito auth_url_host=\(authURL.host ?? "missing", privacy: .public)")
 
         let completed = try rpc.waitForNotification(
             method: "account/login/completed",
@@ -239,16 +243,57 @@ struct CodexAppServerClient {
         return environment
     }
 
-    private static func openAuthenticationURL(_ url: URL) -> Bool {
-        if Thread.isMainThread {
-            return NSWorkspace.shared.open(url)
+    private static func openAuthenticationURL(_ url: URL) throws {
+        guard chromeApplicationURL() != nil else {
+            throw CodexAppServerError.loginFailed("Google Chrome is required to open the ChatGPT login in an incognito window.")
+        }
+        guard FileManager.default.isExecutableFile(atPath: openToolURL.path) else {
+            throw CodexAppServerError.loginFailed("Could not find /usr/bin/open to launch Chrome.")
         }
 
-        var opened = false
-        DispatchQueue.main.sync {
-            opened = NSWorkspace.shared.open(url)
+        let process = Process()
+        process.executableURL = openToolURL
+        process.arguments = chromeIncognitoOpenArguments(for: url)
+
+        let errorPipe = Pipe()
+        process.standardError = errorPipe
+
+        do {
+            try process.run()
+        } catch {
+            throw CodexAppServerError.loginFailed("Could not launch Chrome incognito login window: \(error.localizedDescription)")
         }
-        return opened
+        process.waitUntilExit()
+
+        guard process.terminationStatus == 0 else {
+            let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+            let errorText = String(data: errorData, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let detail = errorText.map { " \($0)" } ?? ""
+            throw CodexAppServerError.loginFailed("Could not launch Chrome incognito login window.\(detail)")
+        }
+    }
+
+    static func chromeIncognitoOpenArguments(for url: URL) -> [String] {
+        [
+            "-b",
+            chromeBundleIdentifier,
+            "--args",
+            "--incognito",
+            url.absoluteString
+        ]
+    }
+
+    private static func chromeApplicationURL() -> URL? {
+        if Thread.isMainThread {
+            return NSWorkspace.shared.urlForApplication(withBundleIdentifier: chromeBundleIdentifier)
+        }
+
+        var applicationURL: URL?
+        DispatchQueue.main.sync {
+            applicationURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: chromeBundleIdentifier)
+        }
+        return applicationURL
     }
 
     private static func isAllowedAuthenticationURL(_ url: URL) -> Bool {

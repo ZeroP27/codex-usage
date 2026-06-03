@@ -50,7 +50,7 @@ struct SettingsView: View {
                         .fixedSize(horizontal: false, vertical: true)
 
                     if store.usageDataSource == .oauthAPI {
-                        Text("Managed accounts are stored by Codex Usage. Adding or switching an account syncs that account to ~/.codex/auth.json; quota refreshes do not.")
+                        Text("Managed accounts are stored by Codex Usage. Adding an account opens Chrome incognito; adding or switching syncs that account to ~/.codex/auth.json; quota refreshes do not.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
