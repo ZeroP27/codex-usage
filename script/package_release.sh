@@ -44,7 +44,7 @@ Options:
   --bundle-id <bundle-id>         Override bundle id, defaults to $BUNDLE_ID
   --arch <arch>                   universal, arm64, x86_64, or host; defaults to universal
   --no-notarize                   Sign only; explicit non-notarized build
-  --unsigned                      Build an unsigned local test package
+  --unsigned                      Build an ad-hoc-signed local/test package
   -h, --help                      Show this help
 
 Environment variables can also provide VERSION, BUILD_NUMBER, SIGN_IDENTITY,
@@ -277,7 +277,10 @@ if [[ "$SIGNING_MODE" == "signed" ]]; then
     echo "Skipping notarization because --no-notarize was provided."
   fi
 else
-  echo "Skipping signing and notarization because --unsigned was provided."
+  echo "Applying an ad-hoc signature for local/test distribution..."
+  /usr/bin/codesign --force --sign - "$APP_BUNDLE"
+  /usr/bin/codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
+  echo "Skipping Developer ID signing and notarization because --unsigned was provided."
 fi
 
 echo "Creating distribution archive..."

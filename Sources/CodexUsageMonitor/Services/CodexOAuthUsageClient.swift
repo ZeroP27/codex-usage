@@ -9,21 +9,25 @@ struct CodexOAuthUsageClient {
     )
 
     func loadSnapshot(
-        authFileURL: URL? = nil,
-        managedAccount: CodexManagedAccount? = nil
+        managedAccount: CodexManagedAccount,
+        accountStore: CodexUsageAccountStore
     ) async throws -> UsageSnapshot {
-        let authFileURL = authFileURL ?? CodexOAuthCredentialsStore.authFileURL
-        var credentials = try CodexOAuthCredentialsStore.load(
-            from: authFileURL,
-            fallbackAccountID: managedAccount?.chatgptAccountID
+        let credentialSnapshot = try accountStore.loadManagedCredentialsForRefresh(
+            accountKey: managedAccount.accountKey
         )
+        var expectedAuthData = credentialSnapshot.authData
+        var credentials = credentialSnapshot.credentials
         try Self.validateCredentials(credentials, match: managedAccount)
 
         if credentials.shouldRefreshBeforeUse {
             credentials = try await CodexOAuthTokenRefresher.refresh(credentials, timeout: timeout)
             try Self.validateCredentials(credentials, match: managedAccount)
-            try CodexOAuthCredentialsStore.save(credentials, to: authFileURL)
-            Self.logger.info("refreshed token before usage key=\(managedAccount?.accountKey ?? "active", privacy: .private)")
+            expectedAuthData = try accountStore.commitRefreshedManagedCredentials(
+                accountKey: managedAccount.accountKey,
+                expectedAuthData: expectedAuthData,
+                credentials: credentials
+            )
+            Self.logger.info("refreshed token before usage key=\(managedAccount.accountKey, privacy: .private)")
         }
 
         do {
@@ -36,8 +40,12 @@ struct CodexOAuthUsageClient {
         } catch CodexOAuthUsageError.unauthorized where !credentials.refreshToken.isEmpty {
             credentials = try await CodexOAuthTokenRefresher.refresh(credentials, timeout: timeout)
             try Self.validateCredentials(credentials, match: managedAccount)
-            try CodexOAuthCredentialsStore.save(credentials, to: authFileURL)
-            Self.logger.info("refreshed token after unauthorized key=\(managedAccount?.accountKey ?? "active", privacy: .private)")
+            _ = try accountStore.commitRefreshedManagedCredentials(
+                accountKey: managedAccount.accountKey,
+                expectedAuthData: expectedAuthData,
+                credentials: credentials
+            )
+            Self.logger.info("refreshed token after unauthorized key=\(managedAccount.accountKey, privacy: .private)")
             let response = try await fetchUsage(credentials: credentials)
             return try Self.makeSnapshot(
                 response: response,
@@ -72,7 +80,10 @@ struct CodexOAuthUsageClient {
     ) throws {
         guard let managedAccount else { return }
         let accountInfo = try credentials.accountInfo()
-        guard accountInfo.accountKey == managedAccount.accountKey else {
+        guard accountInfo.accountKey == managedAccount.accountKey,
+              accountInfo.chatgptAccountID == managedAccount.chatgptAccountID,
+              accountInfo.chatgptUserID == managedAccount.chatgptUserID
+        else {
             throw CodexOAuthUsageError.accountMismatch(
                 expected: managedAccount.accountKey,
                 actual: accountInfo.accountKey
@@ -139,7 +150,7 @@ struct CodexOAuthUsageClient {
         return String(data: data, encoding: .utf8)?.truncatedForDisplay
     }
 
-    private static func makeSnapshot(
+    static func makeSnapshot(
         response: CodexOAuthUsageResponse,
         credentials: CodexOAuthCredentials,
         managedAccount: CodexManagedAccount?) throws -> UsageSnapshot
@@ -150,8 +161,8 @@ struct CodexOAuthUsageClient {
         ].compactMap { role, window -> QuotaWindow? in
             guard let window,
                   let usedPercent = window.usedPercent,
-                  let resetAt = window.resetAt,
-                  let windowSeconds = window.limitWindowSeconds
+                  let windowSeconds = window.limitWindowSeconds,
+                  windowSeconds > 0
             else {
                 return nil
             }
@@ -161,7 +172,9 @@ struct CodexOAuthUsageClient {
                 id: "oauth-\(role)-\(duration)",
                 usedPercent: usedPercent,
                 windowDurationMins: duration,
-                resetsAt: Date(timeIntervalSince1970: TimeInterval(resetAt))
+                resetsAt: window.resetAt.map {
+                    Date(timeIntervalSince1970: TimeInterval($0))
+                }
             )
         }
 
@@ -226,7 +239,7 @@ struct CodexOAuthUsageClient {
     }
 }
 
-struct CodexOAuthCredentials {
+struct CodexOAuthCredentials: Sendable {
     private static let accessTokenRefreshLeeway: TimeInterval = 5 * 60
 
     var accessToken: String
@@ -268,9 +281,13 @@ struct CodexOAuthCredentials {
     }
 
     private static func timeIntervalValue(_ value: Any?) -> TimeInterval? {
-        if let value = value as? TimeInterval { return value }
+        if let value = value as? TimeInterval {
+            return SafeNumericConversions.finiteDouble(value)
+        }
         if let value = value as? Int { return TimeInterval(value) }
-        if let value = value as? String { return TimeInterval(value) }
+        if let value = value as? String {
+            return TimeInterval(value).flatMap(SafeNumericConversions.finiteDouble)
+        }
         return nil
     }
 }
@@ -322,6 +339,13 @@ extension CodexOAuthCredentials {
         guard let chatgptUserID, !chatgptUserID.isEmpty else {
             throw CodexOAuthUsageError.missingAccountInfo("ChatGPT user id is missing.")
         }
+        guard !chatgptAccountID.contains("::"),
+              !chatgptUserID.contains("::")
+        else {
+            throw CodexOAuthUsageError.missingAccountInfo(
+                "ChatGPT account identifiers contain an unsupported delimiter."
+            )
+        }
 
         let planType = trimmedString(auth?["chatgpt_plan_type"] ?? payload["chatgpt_plan_type"])
         return CodexOAuthAccountInfo(
@@ -360,6 +384,8 @@ extension CodexOAuthCredentials {
 }
 
 enum CodexOAuthCredentialsStore {
+    private static let maximumAuthFileByteCount = 2 * 1_024 * 1_024
+
     static var codexHomeURL: URL {
         if let configured = ProcessInfo.processInfo.environment["CODEX_HOME"]?
             .trimmingCharacters(in: .whitespacesAndNewlines),
@@ -382,7 +408,7 @@ enum CodexOAuthCredentialsStore {
             throw CodexOAuthUsageError.credentialsNotFound
         }
 
-        let data = try Data(contentsOf: authFileURL)
+        let data = try readSizeLimitedData(from: authFileURL)
         return try load(from: data, fallbackAccountID: fallbackAccountID)
     }
 
@@ -426,11 +452,10 @@ enum CodexOAuthCredentialsStore {
         )
     }
 
-    static func save(
+    static func updatedData(
         _ credentials: CodexOAuthCredentials,
-        to authFileURL: URL = Self.authFileURL
-    ) throws {
-        let existingData = try Data(contentsOf: authFileURL)
+        existingData: Data
+    ) throws -> Data {
         guard var json = try JSONSerialization.jsonObject(with: existingData) as? [String: Any] else {
             throw CodexOAuthUsageError.decodeFailed("Invalid auth.json")
         }
@@ -450,25 +475,9 @@ enum CodexOAuthCredentialsStore {
         json["tokens"] = tokens
         json["last_refresh"] = ISO8601DateFormatter().string(from: Date())
 
-        let data = try JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
-        try FileManager.default.createDirectory(
-            at: authFileURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        try Self.hardenManagedAccountsDirectoryIfNeeded(for: authFileURL)
-        try data.write(to: authFileURL, options: .atomic)
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o600],
-            ofItemAtPath: authFileURL.path
-        )
-    }
-
-    private static func hardenManagedAccountsDirectoryIfNeeded(for authFileURL: URL) throws {
-        let directoryURL = authFileURL.deletingLastPathComponent()
-        guard directoryURL.lastPathComponent == "accounts" else { return }
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o700],
-            ofItemAtPath: directoryURL.path
+        return try JSONSerialization.data(
+            withJSONObject: json,
+            options: [.prettyPrinted, .sortedKeys]
         )
     }
 
@@ -486,13 +495,38 @@ enum CodexOAuthCredentialsStore {
         snakeCaseKey: String,
         camelCaseKey: String) -> String?
     {
-        if let value = dictionary[snakeCaseKey] as? String, !value.isEmpty {
-            return value
+        if let value = dictionary[snakeCaseKey] as? String {
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                return trimmed
+            }
         }
-        if let value = dictionary[camelCaseKey] as? String, !value.isEmpty {
-            return value
+        if let value = dictionary[camelCaseKey] as? String {
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                return trimmed
+            }
         }
         return nil
+    }
+
+    private static func readSizeLimitedData(from url: URL) throws -> Data {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+
+        var data = Data()
+        let chunkByteCount = 64 * 1_024
+        while data.count <= maximumAuthFileByteCount {
+            let remaining = maximumAuthFileByteCount + 1 - data.count
+            let chunk = try handle.read(
+                upToCount: min(chunkByteCount, remaining)
+            ) ?? Data()
+            if chunk.isEmpty {
+                return data
+            }
+            data.append(chunk)
+        }
+        throw CodexOAuthUsageError.credentialsTooLarge
     }
 }
 
@@ -529,16 +563,9 @@ private enum CodexOAuthTokenRefresher {
                 )
             }
 
-            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                throw CodexOAuthUsageError.decodeFailed("Invalid refresh response")
-            }
-
-            return CodexOAuthCredentials(
-                accessToken: json["access_token"] as? String ?? credentials.accessToken,
-                refreshToken: json["refresh_token"] as? String ?? credentials.refreshToken,
-                idToken: json["id_token"] as? String ?? credentials.idToken,
-                accountID: credentials.accountID,
-                lastRefresh: Date()
+            return try CodexOAuthTokenResponseParser.parse(
+                data: data,
+                previous: credentials
             )
         } catch let error as CodexOAuthUsageError {
             throw error
@@ -562,7 +589,67 @@ private enum CodexOAuthTokenRefresher {
     }
 }
 
-private struct CodexOAuthUsageResponse: Decodable {
+enum CodexOAuthTokenResponseParser {
+    static func parse(
+        data: Data,
+        previous: CodexOAuthCredentials
+    ) throws -> CodexOAuthCredentials {
+        let object: Any
+        do {
+            object = try JSONSerialization.jsonObject(with: data)
+        } catch {
+            throw CodexOAuthUsageError.decodeFailed("Invalid refresh response")
+        }
+        guard let json = object as? [String: Any] else {
+            throw CodexOAuthUsageError.decodeFailed("Invalid refresh response")
+        }
+        guard let accessToken = nonemptyString(json["access_token"]) else {
+            throw CodexOAuthUsageError.decodeFailed(
+                "Refresh response did not contain a non-empty access token"
+            )
+        }
+
+        let refreshToken: String
+        if json.keys.contains("refresh_token") {
+            guard let value = nonemptyString(json["refresh_token"]) else {
+                throw CodexOAuthUsageError.decodeFailed(
+                    "Refresh response contained an empty refresh token"
+                )
+            }
+            refreshToken = value
+        } else {
+            refreshToken = previous.refreshToken
+        }
+
+        let idToken: String?
+        if json.keys.contains("id_token") {
+            guard let value = nonemptyString(json["id_token"]) else {
+                throw CodexOAuthUsageError.decodeFailed(
+                    "Refresh response contained an empty ID token"
+                )
+            }
+            idToken = value
+        } else {
+            idToken = previous.idToken
+        }
+
+        return CodexOAuthCredentials(
+            accessToken: accessToken,
+            refreshToken: refreshToken,
+            idToken: idToken,
+            accountID: previous.accountID,
+            lastRefresh: Date()
+        )
+    }
+
+    private static func nonemptyString(_ value: Any?) -> String? {
+        guard let value = value as? String else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+}
+
+struct CodexOAuthUsageResponse: Decodable {
     var planType: String?
     var rateLimit: RateLimitDetails?
 
@@ -616,13 +703,13 @@ private struct CodexOAuthUsageResponse: Decodable {
             in container: KeyedDecodingContainer<CodingKeys>) -> Double?
         {
             if let value = try? container.decode(Double.self, forKey: key) {
-                return value
+                return SafeNumericConversions.finiteDouble(value)
             }
             if let value = try? container.decode(Int.self, forKey: key) {
                 return Double(value)
             }
             if let value = try? container.decode(String.self, forKey: key) {
-                return Double(value)
+                return Double(value).flatMap(SafeNumericConversions.finiteDouble)
             }
             return nil
         }
@@ -635,7 +722,7 @@ private struct CodexOAuthUsageResponse: Decodable {
                 return value
             }
             if let value = try? container.decode(Double.self, forKey: key) {
-                return Int(value)
+                return SafeNumericConversions.exactInt(value)
             }
             if let value = try? container.decode(String.self, forKey: key) {
                 return Int(value)
@@ -647,6 +734,7 @@ private struct CodexOAuthUsageResponse: Decodable {
 
 enum CodexOAuthUsageError: LocalizedError {
     case credentialsNotFound
+    case credentialsTooLarge
     case missingTokens
     case missingAccountInfo(String)
     case unauthorized
@@ -661,6 +749,8 @@ enum CodexOAuthUsageError: LocalizedError {
         switch self {
         case .credentialsNotFound:
             return "Managed account credentials were not found. Add the account again in Settings."
+        case .credentialsTooLarge:
+            return "Managed account credentials exceed the supported 2 MiB size limit."
         case .missingTokens:
             return "Managed account auth data does not contain ChatGPT OAuth tokens. Add the account again in Settings."
         case .missingAccountInfo(let message):

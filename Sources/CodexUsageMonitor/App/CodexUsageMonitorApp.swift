@@ -12,6 +12,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 struct CodexUsageMonitorApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var store = CodexUsageStore()
+    @StateObject private var launchAtLogin = LaunchAtLoginController()
 
     var body: some Scene {
         MenuBarExtra {
@@ -26,7 +27,7 @@ struct CodexUsageMonitorApp: App {
         .menuBarExtraStyle(.window)
 
         Settings {
-            SettingsView(store: store)
+            SettingsView(store: store, launchAtLogin: launchAtLogin)
         }
     }
 

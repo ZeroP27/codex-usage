@@ -64,6 +64,12 @@ cat >"$INFO_PLIST" <<PLIST
 </plist>
 PLIST
 
+# SMAppService requires the containing app to be code signed. A local ad-hoc
+# signature is sufficient for development bundles; Developer ID builds use the
+# signed path in package_release.sh.
+/usr/bin/codesign --force --sign - "$APP_BUNDLE"
+/usr/bin/codesign --verify --deep --strict "$APP_BUNDLE"
+
 open_app() {
   /usr/bin/open -n "$APP_BUNDLE"
 }
@@ -88,8 +94,15 @@ case "$MODE" in
     ;;
   --verify|verify)
     open_app
-    sleep 1
-    pgrep -x "$EXECUTABLE_NAME" >/dev/null
+    PROCESS_STARTED="no"
+    for _ in {1..50}; do
+      if pgrep -x "$EXECUTABLE_NAME" >/dev/null; then
+        PROCESS_STARTED="yes"
+        break
+      fi
+      sleep 0.2
+    done
+    [[ "$PROCESS_STARTED" == "yes" ]]
     ;;
   *)
     echo "usage: $0 [run|--bundle|--debug|--logs|--telemetry|--verify]" >&2

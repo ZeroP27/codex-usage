@@ -1,5 +1,40 @@
+import Darwin
+import CryptoKit
 import Foundation
 import OSLog
+
+struct CodexManagedAccountsArchive: Codable, Equatable, Sendable {
+    var schemaVersion: Int
+    var registryData: Data
+    var authSnapshots: [CodexManagedAuthArchive]
+
+    enum CodingKeys: String, CodingKey {
+        case schemaVersion = "schema_version"
+        case registryData = "registry_data"
+        case authSnapshots = "auth_snapshots"
+    }
+}
+
+struct CodexManagedAuthArchive: Codable, Equatable, Sendable {
+    var accountKey: String
+    var authData: Data
+
+    enum CodingKeys: String, CodingKey {
+        case accountKey = "account_key"
+        case authData = "auth_data"
+    }
+}
+
+struct CodexManagedCredentialsSnapshot: Sendable {
+    var accountKey: String
+    var authData: Data
+    var credentials: CodexOAuthCredentials
+}
+
+struct CodexManagedAccountsImportBaseline: Sendable {
+    var snapshot: CodexManagedAccountsSnapshot
+    var storageRevision: String
+}
 
 struct CodexUsageAccountStore {
     var applicationSupportURL: URL = Self.defaultApplicationSupportURL()
@@ -7,10 +42,45 @@ struct CodexUsageAccountStore {
 
     private static let schemaVersion = 1
     private static let maxSupportedSchemaVersion = 1
+    private static let maximumManagedAccountCount = 100
+    private static let maximumRegistryByteCount = 4 * 1_024 * 1_024
+    private static let maximumAuthSnapshotByteCount = 2 * 1_024 * 1_024
+    private static let maximumArchivePlaintextByteCount = 32 * 1_024 * 1_024
     private static let logger = Logger(
         subsystem: "dev.idea-space.CodexUsageMonitor",
         category: "ManagedAccounts"
     )
+
+    private enum FileLockMode {
+        case shared
+        case exclusive
+
+        var operation: Int32 {
+            switch self {
+            case .shared:
+                return LOCK_SH
+            case .exclusive:
+                return LOCK_EX
+            }
+        }
+    }
+
+    private enum ActiveAuthState {
+        case managed(accountKey: String, authData: Data)
+        case unmanaged
+        case missing
+        case unreadable
+    }
+
+    private enum ReplacementCredentialAuthority: Equatable {
+        case newlyAuthenticated
+        case currentActiveAuth
+    }
+
+    private struct ValidatedArchive {
+        var registry: ManagedAccountsRegistryFile
+        var authDataByAccountKey: [String: Data]
+    }
 
     var accountsDirectoryURL: URL {
         applicationSupportURL.appendingPathComponent("accounts", isDirectory: true)
@@ -24,14 +94,48 @@ struct CodexUsageAccountStore {
         codexHomeURL.appendingPathComponent("auth.json")
     }
 
+    private var lockFileURL: URL {
+        applicationSupportURL.appendingPathComponent("accounts.lock")
+    }
+
+    private var legacyPlaintextBackupURL: URL {
+        accountsDirectoryURL.appendingPathComponent("auth.json.bak")
+    }
+
+    private static let importStagingDirectoryPrefix = ".accounts-import-"
+
+    func performStartupMaintenance() throws {
+        try withFileLock(.exclusive) {
+            reportLegacyPlaintextBackupIfPresentLocked()
+            try removeAbandonedImportStagingDirectoriesLocked()
+        }
+    }
+
     func loadSnapshot() throws -> CodexManagedAccountsSnapshot {
-        let registry = try loadRegistryFile()
-        return makeSnapshot(from: registry, activeAccountKey: registry.activeAccountKey)
+        try withFileLock(.shared) {
+            let registry = try loadRegistryFile()
+            return makeSnapshot(from: registry, activeAccountKey: registry.activeAccountKey)
+        }
     }
 
     func loadSnapshot(markingActiveAccountKey activeAccountKey: String?) throws -> CodexManagedAccountsSnapshot {
-        let registry = try loadRegistryFile()
-        return makeSnapshot(from: registry, activeAccountKey: activeAccountKey)
+        try withFileLock(.shared) {
+            let registry = try loadRegistryFile()
+            return makeSnapshot(from: registry, activeAccountKey: activeAccountKey)
+        }
+    }
+
+    func loadImportBaseline() throws -> CodexManagedAccountsImportBaseline {
+        try withFileLock(.shared) {
+            let registry = try loadRegistryFile()
+            return CodexManagedAccountsImportBaseline(
+                snapshot: makeSnapshot(
+                    from: registry,
+                    activeAccountKey: registry.activeAccountKey
+                ),
+                storageRevision: try storageRevisionLocked()
+            )
+        }
     }
 
     private func makeSnapshot(
@@ -55,22 +159,499 @@ struct CodexUsageAccountStore {
         accountsDirectoryURL.appendingPathComponent(try Self.accountSnapshotFilename(accountKey: accountKey))
     }
 
+    func loadManagedCredentialsForRefresh(
+        accountKey: String
+    ) throws -> CodexManagedCredentialsSnapshot {
+        try withFileLock(.shared) {
+            let registry = try loadRegistryFile()
+            guard let account = registry.accounts.first(where: {
+                $0.accountKey == accountKey
+            }) else {
+                throw CodexUsageAccountStoreError.accountNotFound
+            }
+            if case .managed(let activeAccountKey, _) = try activeAuthState(
+                registry: registry
+            ), activeAccountKey == accountKey {
+                throw CodexUsageAccountStoreError.managedAuthRefreshConflict
+            }
+
+            let authURL = try authFileURL(for: accountKey)
+            guard FileManager.default.fileExists(atPath: authURL.path) else {
+                throw CodexUsageAccountStoreError.authSnapshotNotFound(
+                    authURL.path
+                )
+            }
+            let authData = try readSizeLimitedData(
+                at: authURL,
+                maximumByteCount: Self.maximumAuthSnapshotByteCount
+            )
+            let credentials = try validateAuthData(authData, for: account)
+            return CodexManagedCredentialsSnapshot(
+                accountKey: accountKey,
+                authData: authData,
+                credentials: credentials
+            )
+        }
+    }
+
+    func commitRefreshedManagedCredentials(
+        accountKey: String,
+        expectedAuthData: Data,
+        credentials: CodexOAuthCredentials
+    ) throws -> Data {
+        try withFileLock(.exclusive) {
+            let registry = try loadRegistryFile()
+            guard let account = registry.accounts.first(where: {
+                $0.accountKey == accountKey
+            }) else {
+                throw CodexUsageAccountStoreError.managedAuthRefreshConflict
+            }
+            if case .managed(let activeAccountKey, _) = try activeAuthState(
+                registry: registry
+            ), activeAccountKey == accountKey {
+                throw CodexUsageAccountStoreError.managedAuthRefreshConflict
+            }
+
+            let authURL = try authFileURL(for: accountKey)
+            guard FileManager.default.fileExists(atPath: authURL.path) else {
+                throw CodexUsageAccountStoreError.managedAuthRefreshConflict
+            }
+            let currentAuthData = try readSizeLimitedData(
+                at: authURL,
+                maximumByteCount: Self.maximumAuthSnapshotByteCount
+            )
+            guard currentAuthData == expectedAuthData else {
+                throw CodexUsageAccountStoreError.managedAuthRefreshConflict
+            }
+            _ = try validateAuthData(currentAuthData, for: account)
+
+            let refreshedAccountInfo = try credentials.accountInfo()
+            guard refreshedAccountInfo.accountKey == accountKey else {
+                throw CodexUsageAccountStoreError.authSnapshotAccountMismatch(
+                    expected: accountKey,
+                    actual: refreshedAccountInfo.accountKey
+                )
+            }
+            let updatedData = try CodexOAuthCredentialsStore.updatedData(
+                credentials,
+                existingData: currentAuthData
+            )
+            guard updatedData.count <= Self.maximumAuthSnapshotByteCount else {
+                throw CodexUsageAccountStoreError.archiveTooLarge
+            }
+            _ = try validateAuthData(updatedData, for: account)
+            try OwnerOnlyFileWriter.write(updatedData, to: authURL)
+            Self.logger.info("committed refreshed managed credentials key_fp=\(LogFingerprint.account(accountKey), privacy: .public)")
+            return updatedData
+        }
+    }
+
+    func exportArchive() throws -> CodexManagedAccountsArchive {
+        try withFileLock(.shared) {
+            var registry = try loadRegistryFile()
+            try validateRegistry(registry)
+            var activeAuthOverride: (accountKey: String, authData: Data)?
+            switch try activeAuthState(registry: registry) {
+            case .managed(let accountKey, let authData):
+                registry.activeAccountKey = accountKey
+                activeAuthOverride = (accountKey, authData)
+            case .missing, .unmanaged:
+                registry.activeAccountKey = nil
+            case .unreadable:
+                break
+            }
+
+            let snapshots = try registry.accounts.map { account in
+                let authURL = try authFileURL(for: account.accountKey)
+                guard FileManager.default.fileExists(atPath: authURL.path) else {
+                    throw CodexUsageAccountStoreError.authSnapshotNotFound(authURL.path)
+                }
+                let authData: Data
+                if activeAuthOverride?.accountKey == account.accountKey,
+                   let currentAuthData = activeAuthOverride?.authData
+                {
+                    authData = currentAuthData
+                } else {
+                    authData = try readSizeLimitedData(
+                        at: authURL,
+                        maximumByteCount: Self.maximumAuthSnapshotByteCount
+                    )
+                }
+                guard authData.count <= Self.maximumAuthSnapshotByteCount else {
+                    throw CodexUsageAccountStoreError.archiveTooLarge
+                }
+                try validateAuthData(authData, for: account)
+                return CodexManagedAuthArchive(
+                    accountKey: account.accountKey,
+                    authData: authData
+                )
+            }
+
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            return CodexManagedAccountsArchive(
+                schemaVersion: Self.schemaVersion,
+                registryData: try encoder.encode(registry),
+                authSnapshots: snapshots
+            )
+        }
+    }
+
+    func importArchive(
+        _ archive: CodexManagedAccountsArchive,
+        replacingStorageRevision expectedStorageRevision: String
+    ) throws -> CodexManagedAccountsSnapshot {
+        try withFileLock(.exclusive) {
+            guard try storageRevisionLocked() == expectedStorageRevision else {
+                throw CodexUsageAccountStoreError.storageChangedSinceImportPreview
+            }
+            return try importArchiveLocked(archive)
+        }
+    }
+
+    func validateArchive(
+        _ archive: CodexManagedAccountsArchive
+    ) throws -> CodexManagedAccountsSnapshot {
+        let validated = try validatedArchive(archive)
+        return makeSnapshot(
+            from: validated.registry,
+            activeAccountKey: validated.registry.activeAccountKey
+        )
+    }
+
+    private func importArchiveLocked(
+        _ archive: CodexManagedAccountsArchive
+    ) throws -> CodexManagedAccountsSnapshot {
+        let validated = try validatedArchive(archive)
+        var registry = validated.registry
+        switch try activeAuthState(registry: registry) {
+        case .managed(let accountKey, _):
+            registry.activeAccountKey = accountKey
+        case .missing, .unmanaged, .unreadable:
+            registry.activeAccountKey = nil
+        }
+
+        let stagingURL = applicationSupportURL.appendingPathComponent(
+            "\(Self.importStagingDirectoryPrefix)\(UUID().uuidString)",
+            isDirectory: true
+        )
+        var removeStagingOnExit = true
+        defer {
+            if removeStagingOnExit,
+               FileManager.default.fileExists(atPath: stagingURL.path)
+            {
+                try? FileManager.default.removeItem(at: stagingURL)
+            }
+        }
+
+        try FileManager.default.createDirectory(
+            at: stagingURL,
+            withIntermediateDirectories: false
+        )
+        try Self.setOwnerOnlyDirectoryPermissions(stagingURL)
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try OwnerOnlyFileWriter.write(
+            try encoder.encode(registry),
+            to: stagingURL.appendingPathComponent("registry.json")
+        )
+        for account in registry.accounts {
+            guard let authData = validated.authDataByAccountKey[account.accountKey] else {
+                throw CodexUsageAccountStoreError.archiveInvalid(
+                    "An account auth snapshot is missing."
+                )
+            }
+            try OwnerOnlyFileWriter.write(
+                authData,
+                to: stagingURL.appendingPathComponent(
+                    try Self.accountSnapshotFilename(accountKey: account.accountKey)
+                )
+            )
+        }
+        if FileManager.default.fileExists(atPath: legacyPlaintextBackupURL.path) {
+            let legacyBackupData = try readSizeLimitedData(
+                at: legacyPlaintextBackupURL,
+                maximumByteCount: Self.maximumAuthSnapshotByteCount
+            )
+            try OwnerOnlyFileWriter.write(
+                legacyBackupData,
+                to: stagingURL.appendingPathComponent("auth.json.bak")
+            )
+            Self.logger.info("preserved legacy active auth backup during managed account import filename=auth.json.bak")
+        }
+
+        if FileManager.default.fileExists(atPath: accountsDirectoryURL.path) {
+            guard renameatx_np(
+                AT_FDCWD,
+                stagingURL.path,
+                AT_FDCWD,
+                accountsDirectoryURL.path,
+                UInt32(RENAME_SWAP)
+            ) == 0 else {
+                let message = POSIXError(
+                    POSIXErrorCode(rawValue: errno) ?? .EIO
+                ).localizedDescription
+                throw CodexUsageAccountStoreError.importCommitFailed(message)
+            }
+
+            do {
+                try FileManager.default.removeItem(at: stagingURL)
+                removeStagingOnExit = false
+            } catch {
+                // The swap is the commit point. removeItem may already have
+                // deleted part of the old directory, so swapping it back can
+                // corrupt the live account set. Keep any remainder for the
+                // next startup's exact UUID-staging cleanup instead.
+                removeStagingOnExit = false
+                Self.logger.error("managed account import committed but old directory cleanup failed staging=\(stagingURL.path, privacy: .private) error_type=\(LogErrorSummary.category(error), privacy: .public) error=\(error.localizedDescription, privacy: .private)")
+            }
+        } else {
+            guard rename(stagingURL.path, accountsDirectoryURL.path) == 0 else {
+                let message = POSIXError(
+                    POSIXErrorCode(rawValue: errno) ?? .EIO
+                ).localizedDescription
+                throw CodexUsageAccountStoreError.importCommitFailed(message)
+            }
+            removeStagingOnExit = false
+        }
+
+        Self.logger.info("imported managed account archive count=\(registry.accounts.count, privacy: .public) active_fp=\(LogFingerprint.account(registry.activeAccountKey), privacy: .public)")
+        return makeSnapshot(from: registry, activeAccountKey: registry.activeAccountKey)
+    }
+
+    private func reportLegacyPlaintextBackupIfPresentLocked() {
+        guard FileManager.default.fileExists(
+            atPath: legacyPlaintextBackupURL.path
+        ) else {
+            return
+        }
+        Self.logger.warning("legacy active auth backup preserved pending explicit user cleanup filename=auth.json.bak")
+    }
+
+    private func removeAbandonedImportStagingDirectoriesLocked() throws {
+        let entries = try FileManager.default.contentsOfDirectory(
+            at: applicationSupportURL,
+            includingPropertiesForKeys: nil,
+            options: []
+        )
+        for entry in entries {
+            let name = entry.lastPathComponent
+            guard name.hasPrefix(Self.importStagingDirectoryPrefix) else {
+                continue
+            }
+            let identifier = String(
+                name.dropFirst(Self.importStagingDirectoryPrefix.count)
+            )
+            guard UUID(uuidString: identifier) != nil else {
+                continue
+            }
+            try FileManager.default.removeItem(at: entry)
+            Self.logger.info("removed abandoned managed account import staging directory id=\(identifier, privacy: .private)")
+        }
+    }
+
+    private func validatedArchive(
+        _ archive: CodexManagedAccountsArchive
+    ) throws -> ValidatedArchive {
+        guard archive.schemaVersion == Self.schemaVersion else {
+            throw CodexUsageAccountStoreError.unsupportedSchema(
+                archive.schemaVersion
+            )
+        }
+        guard archive.registryData.count <= Self.maximumRegistryByteCount else {
+            throw CodexUsageAccountStoreError.archiveTooLarge
+        }
+
+        let registry: ManagedAccountsRegistryFile
+        do {
+            registry = try JSONDecoder().decode(
+                ManagedAccountsRegistryFile.self,
+                from: archive.registryData
+            )
+        } catch {
+            throw CodexUsageAccountStoreError.archiveInvalid(
+                "The managed account registry could not be decoded."
+            )
+        }
+        try validateRegistry(registry)
+
+        guard archive.authSnapshots.count == registry.accounts.count else {
+            throw CodexUsageAccountStoreError.archiveInvalid(
+                "The auth snapshot count does not match the account registry."
+            )
+        }
+
+        var totalBytes = archive.registryData.count
+        var authDataByAccountKey: [String: Data] = [:]
+        for snapshot in archive.authSnapshots {
+            guard snapshot.authData.count <= Self.maximumAuthSnapshotByteCount else {
+                throw CodexUsageAccountStoreError.archiveTooLarge
+            }
+            guard totalBytes <= Self.maximumArchivePlaintextByteCount - snapshot.authData.count else {
+                throw CodexUsageAccountStoreError.archiveTooLarge
+            }
+            totalBytes += snapshot.authData.count
+            guard authDataByAccountKey.updateValue(
+                snapshot.authData,
+                forKey: snapshot.accountKey
+            ) == nil else {
+                throw CodexUsageAccountStoreError.archiveInvalid(
+                    "The archive contains duplicate auth snapshots."
+                )
+            }
+        }
+
+        let expectedAccountKeys = Set(registry.accounts.map(\.accountKey))
+        guard Set(authDataByAccountKey.keys) == expectedAccountKeys else {
+            throw CodexUsageAccountStoreError.archiveInvalid(
+                "The auth snapshots do not match the account registry."
+            )
+        }
+        for account in registry.accounts {
+            guard let authData = authDataByAccountKey[account.accountKey] else {
+                throw CodexUsageAccountStoreError.archiveInvalid(
+                    "An account auth snapshot is missing."
+                )
+            }
+            try validateAuthData(authData, for: account)
+        }
+
+        return ValidatedArchive(
+            registry: registry,
+            authDataByAccountKey: authDataByAccountKey
+        )
+    }
+
+    private func validateRegistry(
+        _ registry: ManagedAccountsRegistryFile
+    ) throws {
+        guard registry.schemaVersion == Self.schemaVersion else {
+            throw CodexUsageAccountStoreError.unsupportedSchema(
+                registry.schemaVersion
+            )
+        }
+        guard registry.accounts.count <= Self.maximumManagedAccountCount else {
+            throw CodexUsageAccountStoreError.archiveInvalid(
+                "The archive contains too many managed accounts."
+            )
+        }
+
+        var accountKeys = Set<String>()
+        var snapshotFilenames = Set<String>()
+        for account in registry.accounts {
+            let accountKey = account.accountKey
+            guard !accountKey.isEmpty,
+                  accountKey.utf8.count <= 160,
+                  !account.chatgptAccountID.isEmpty,
+                  account.chatgptAccountID.utf8.count <= 160,
+                  !account.chatgptAccountID.contains("::"),
+                  !account.chatgptUserID.isEmpty,
+                  account.chatgptUserID.utf8.count <= 160,
+                  !account.chatgptUserID.contains("::"),
+                  accountKey == "\(account.chatgptUserID)::\(account.chatgptAccountID)",
+                  !account.email.isEmpty,
+                  account.email.utf8.count <= 512,
+                  account.alias.utf8.count <= 512,
+                  (account.accountName?.utf8.count ?? 0) <= 512,
+                  (account.plan?.utf8.count ?? 0) <= 128,
+                  account.authMode == nil || account.authMode == "chatgpt"
+            else {
+                throw CodexUsageAccountStoreError.archiveInvalid(
+                    "The account registry contains an invalid account identity."
+                )
+            }
+            guard accountKeys.insert(accountKey).inserted else {
+                throw CodexUsageAccountStoreError.archiveInvalid(
+                    "The account registry contains duplicate accounts."
+                )
+            }
+            let filename = try Self.accountSnapshotFilename(
+                accountKey: accountKey
+            )
+            guard snapshotFilenames.insert(filename.lowercased()).inserted else {
+                throw CodexUsageAccountStoreError.archiveInvalid(
+                    "Two accounts resolve to the same auth snapshot filename."
+                )
+            }
+        }
+
+        if let activeAccountKey = registry.activeAccountKey,
+           !accountKeys.contains(activeAccountKey)
+        {
+            throw CodexUsageAccountStoreError.archiveInvalid(
+                "The active account is not present in the account registry."
+            )
+        }
+    }
+
+    @discardableResult
+    private func validateAuthData(
+        _ authData: Data,
+        for account: ManagedAccountRecord
+    ) throws -> CodexOAuthCredentials {
+        let credentials: CodexOAuthCredentials
+        let accountInfo: CodexOAuthAccountInfo
+        do {
+            credentials = try CodexOAuthCredentialsStore.load(from: authData)
+            accountInfo = try credentials.accountInfo()
+        } catch {
+            throw CodexUsageAccountStoreError.archiveInvalid(
+                "A managed account auth snapshot is invalid."
+            )
+        }
+        guard accountInfo.accountKey == account.accountKey,
+              accountInfo.chatgptAccountID == account.chatgptAccountID,
+              accountInfo.chatgptUserID == account.chatgptUserID
+        else {
+            throw CodexUsageAccountStoreError.authSnapshotAccountMismatch(
+                expected: account.accountKey,
+                actual: accountInfo.accountKey
+            )
+        }
+        return credentials
+    }
+
     func addAccount(authData sourceData: Data) throws -> CodexManagedAccount {
+        try withFileLock(.exclusive) {
+            try addAccountLocked(authData: sourceData)
+        }
+    }
+
+    private func addAccountLocked(authData sourceData: Data) throws -> CodexManagedAccount {
+        guard sourceData.count <= Self.maximumAuthSnapshotByteCount else {
+            throw CodexUsageAccountStoreError.archiveTooLarge
+        }
         let credentials = try CodexOAuthCredentialsStore.load(from: sourceData)
         let accountInfo = try credentials.accountInfo()
         let destinationURL = try self.authFileURL(for: accountInfo.accountKey)
         Self.logger.info("importing managed account key_fp=\(LogFingerprint.account(accountInfo.accountKey), privacy: .public) account_id_fp=\(LogFingerprint.account(accountInfo.chatgptAccountID), privacy: .public) key=\(accountInfo.accountKey, privacy: .private) email=\(accountInfo.email, privacy: .private) plan=\(accountInfo.planType ?? "missing", privacy: .public) account_id_source=\(accountInfo.accountIDSource, privacy: .public)")
 
-        _ = try captureActiveAuthToManagedSnapshot()
+        _ = try captureActiveAuthToManagedSnapshotLocked()
+
+        let existingRegistry = try loadRegistryFile()
+        for existingAccount in existingRegistry.accounts
+            where existingAccount.accountKey != accountInfo.accountKey
+        {
+            let existingFilename = try Self.accountSnapshotFilename(
+                accountKey: existingAccount.accountKey
+            )
+            guard existingFilename.lowercased()
+                    != destinationURL.lastPathComponent.lowercased()
+            else {
+                throw CodexUsageAccountStoreError.archiveInvalid(
+                    "Two accounts resolve to the same auth snapshot filename."
+                )
+            }
+        }
 
         try ensureAccountsDirectory()
         let previousSnapshotData = try authSnapshotDataIfExists(at: destinationURL)
-        try sourceData.write(to: destinationURL, options: .atomic)
-        try Self.setOwnerOnlyPermissions(destinationURL)
+        try OwnerOnlyFileWriter.write(sourceData, to: destinationURL)
         Self.logger.info("stored managed auth snapshot key_fp=\(LogFingerprint.account(accountInfo.accountKey), privacy: .public) key=\(accountInfo.accountKey, privacy: .private) path=\(destinationURL.path, privacy: .private)")
 
         do {
-            var registry = try loadRegistryFile()
+            var registry = existingRegistry
             let now = Int64(Date().timeIntervalSince1970)
             let existing = registry.accounts.first { $0.accountKey == accountInfo.accountKey }
             let nextRecord = ManagedAccountRecord(
@@ -91,11 +672,13 @@ struct CodexUsageAccountStore {
             upsert(nextRecord, in: &registry)
             let previousActiveKey = registry.activeAccountKey
             registry.activeAccountKey = accountInfo.accountKey
+            try validateRegistry(registry)
             Self.logger.info("managed account registry prepared key_fp=\(LogFingerprint.account(accountInfo.accountKey), privacy: .public) previous_active_fp=\(LogFingerprint.account(previousActiveKey), privacy: .public) key=\(accountInfo.accountKey, privacy: .private) replacing_existing=\((existing != nil), privacy: .public) previous_active=\(previousActiveKey ?? "missing", privacy: .private) next_count=\(registry.accounts.count, privacy: .public)")
             try replaceActiveAuthThenSaveRegistry(
                 sourceAuthURL: destinationURL,
                 registry: registry,
-                keyForLog: accountInfo.accountKey
+                keyForLog: accountInfo.accountKey,
+                credentialAuthority: .newlyAuthenticated
             )
 
             Self.logger.info("added managed account key_fp=\(LogFingerprint.account(accountInfo.accountKey), privacy: .public) key=\(accountInfo.accountKey, privacy: .private) active_auth_synced=true registry_saved=true")
@@ -111,13 +694,33 @@ struct CodexUsageAccountStore {
     }
 
     func removeAccount(accountKey: String) throws -> CodexManagedAccountsSnapshot {
+        try withFileLock(.exclusive) {
+            try removeAccountLocked(accountKey: accountKey)
+        }
+    }
+
+    private func removeAccountLocked(accountKey: String) throws -> CodexManagedAccountsSnapshot {
         var registry = try loadRegistryFile()
         guard registry.accounts.contains(where: { $0.accountKey == accountKey }) else {
             throw CodexUsageAccountStoreError.accountNotFound
         }
-        let activeAuthAccountKey = try managedAccountKeyForActiveAuth()
-        guard registry.activeAccountKey != accountKey && activeAuthAccountKey != accountKey else {
+
+        let previousRegistryActiveKey = registry.activeAccountKey
+        let activeAuthState = try activeAuthState(registry: registry)
+        switch activeAuthState {
+        case .managed(let activeAccountKey, _):
+            registry.activeAccountKey = activeAccountKey
+        case .missing, .unmanaged:
+            registry.activeAccountKey = nil
+        case .unreadable:
+            break
+        }
+
+        guard registry.activeAccountKey != accountKey else {
             throw CodexUsageAccountStoreError.activeAccountCannotBeRemoved
+        }
+        if registry.activeAccountKey != previousRegistryActiveKey {
+            Self.logger.info("reconciled registry active account before removal previous_fp=\(LogFingerprint.account(previousRegistryActiveKey), privacy: .public) actual_fp=\(LogFingerprint.account(registry.activeAccountKey), privacy: .public)")
         }
 
         let authURL = try authFileURL(for: accountKey)
@@ -127,7 +730,10 @@ struct CodexUsageAccountStore {
         }
 
         Self.logger.info("removing managed account key_fp=\(LogFingerprint.account(accountKey), privacy: .public) key=\(accountKey, privacy: .private) previous_count=\(registry.accounts.count, privacy: .public)")
-        let previousSnapshotData = try Data(contentsOf: authURL)
+        let previousSnapshotData = try readSizeLimitedData(
+            at: authURL,
+            maximumByteCount: Self.maximumAuthSnapshotByteCount
+        )
         registry.accounts.removeAll { $0.accountKey == accountKey }
 
         try FileManager.default.removeItem(at: authURL)
@@ -142,20 +748,34 @@ struct CodexUsageAccountStore {
             throw error
         }
         Self.logger.info("removed managed account key_fp=\(LogFingerprint.account(accountKey), privacy: .public) key=\(accountKey, privacy: .private) next_count=\(registry.accounts.count, privacy: .public)")
-        return try loadSnapshot()
+        return makeSnapshot(from: registry, activeAccountKey: registry.activeAccountKey)
     }
 
     func activateAccount(accountKey: String) throws {
+        try withFileLock(.exclusive) {
+            try activateAccountLocked(accountKey: accountKey)
+        }
+    }
+
+    private func activateAccountLocked(accountKey: String) throws {
         var registry = try loadRegistryFile()
         guard registry.accounts.contains(where: { $0.accountKey == accountKey }) else {
             throw CodexUsageAccountStoreError.accountNotFound
         }
 
-        _ = try captureActiveAuthToManagedSnapshot()
+        _ = try captureActiveAuthToManagedSnapshotLocked()
 
         let sourceAuthURL = try authFileURL(for: accountKey)
         guard FileManager.default.fileExists(atPath: sourceAuthURL.path) else {
             throw CodexUsageAccountStoreError.authSnapshotNotFound(sourceAuthURL.path)
+        }
+        let sourceCredentials = try CodexOAuthCredentialsStore.load(from: sourceAuthURL)
+        let sourceAccountInfo = try sourceCredentials.accountInfo()
+        guard sourceAccountInfo.accountKey == accountKey else {
+            throw CodexUsageAccountStoreError.authSnapshotAccountMismatch(
+                expected: accountKey,
+                actual: sourceAccountInfo.accountKey
+            )
         }
 
         let previousActiveKey = registry.activeAccountKey
@@ -164,7 +784,8 @@ struct CodexUsageAccountStore {
         try replaceActiveAuthThenSaveRegistry(
             sourceAuthURL: sourceAuthURL,
             registry: registry,
-            keyForLog: accountKey
+            keyForLog: accountKey,
+            credentialAuthority: .currentActiveAuth
         )
 
         Self.logger.info("activated managed account key_fp=\(LogFingerprint.account(accountKey), privacy: .public) key=\(accountKey, privacy: .private)")
@@ -172,12 +793,23 @@ struct CodexUsageAccountStore {
 
     @discardableResult
     func captureActiveAuthToManagedSnapshot(expectedAccountKey: String? = nil) throws -> String? {
+        try withFileLock(.exclusive) {
+            try captureActiveAuthToManagedSnapshotLocked(expectedAccountKey: expectedAccountKey)
+        }
+    }
+
+    private func captureActiveAuthToManagedSnapshotLocked(
+        expectedAccountKey: String? = nil
+    ) throws -> String? {
         guard FileManager.default.fileExists(atPath: activeAuthFileURL.path) else {
             Self.logger.info("active auth capture skipped reason=missing_active_auth expected_fp=\(LogFingerprint.account(expectedAccountKey), privacy: .public)")
             return nil
         }
 
-        let activeData = try Data(contentsOf: activeAuthFileURL)
+        let activeData = try readSizeLimitedData(
+            at: activeAuthFileURL,
+            maximumByteCount: Self.maximumAuthSnapshotByteCount
+        )
         let activeAccountInfo: CodexOAuthAccountInfo
         do {
             let activeCredentials = try CodexOAuthCredentialsStore.load(from: activeData)
@@ -193,7 +825,7 @@ struct CodexUsageAccountStore {
         }
 
         let registry = try loadRegistryFile()
-        guard registry.accounts.contains(where: { $0.accountKey == activeAccountInfo.accountKey }) else {
+        guard registryContainsIdentity(activeAccountInfo, in: registry) else {
             Self.logger.info("active auth capture skipped reason=unmanaged_account active_fp=\(LogFingerprint.account(activeAccountInfo.accountKey), privacy: .public) active=\(activeAccountInfo.accountKey, privacy: .private)")
             return nil
         }
@@ -207,38 +839,63 @@ struct CodexUsageAccountStore {
         }
 
         try ensureAccountsDirectory()
-        try activeData.write(to: managedAuthURL, options: .atomic)
-        try Self.setOwnerOnlyPermissions(managedAuthURL)
+        try OwnerOnlyFileWriter.write(activeData, to: managedAuthURL)
         Self.logger.info("active auth captured into managed snapshot active_fp=\(LogFingerprint.account(activeAccountInfo.accountKey), privacy: .public) active=\(activeAccountInfo.accountKey, privacy: .private)")
         return activeAccountInfo.accountKey
     }
 
     func managedAccountKeyForActiveAuth() throws -> String? {
+        try withFileLock(.shared) {
+            let registry = try loadRegistryFile()
+            guard case .managed(let accountKey, _) = try activeAuthState(registry: registry) else {
+                return nil
+            }
+            return accountKey
+        }
+    }
+
+    private func activeAuthState(
+        registry: ManagedAccountsRegistryFile
+    ) throws -> ActiveAuthState {
         guard FileManager.default.fileExists(atPath: activeAuthFileURL.path) else {
             Self.logger.info("active auth account lookup skipped reason=missing_active_auth")
-            return nil
+            return .missing
         }
 
-        let activeData = try Data(contentsOf: activeAuthFileURL)
+        let activeData = try readSizeLimitedData(
+            at: activeAuthFileURL,
+            maximumByteCount: Self.maximumAuthSnapshotByteCount
+        )
         let activeAccountInfo: CodexOAuthAccountInfo
         do {
             activeAccountInfo = try CodexOAuthCredentialsStore.load(from: activeData).accountInfo()
         } catch {
             Self.logger.info("active auth account lookup skipped reason=unreadable_active_auth error_type=\(LogErrorSummary.category(error), privacy: .public) error=\(error.localizedDescription, privacy: .private)")
-            return nil
+            return .unreadable
         }
 
-        let registry = try loadRegistryFile()
-        guard registry.accounts.contains(where: { $0.accountKey == activeAccountInfo.accountKey }) else {
+        guard registryContainsIdentity(activeAccountInfo, in: registry) else {
             Self.logger.info("active auth account lookup skipped reason=unmanaged_account active_fp=\(LogFingerprint.account(activeAccountInfo.accountKey), privacy: .public) active=\(activeAccountInfo.accountKey, privacy: .private)")
-            return nil
+            return .unmanaged
         }
 
         Self.logger.info("active auth account resolved active_fp=\(LogFingerprint.account(activeAccountInfo.accountKey), privacy: .public) active=\(activeAccountInfo.accountKey, privacy: .private)")
-        return activeAccountInfo.accountKey
+        return .managed(
+            accountKey: activeAccountInfo.accountKey,
+            authData: activeData
+        )
     }
 
     func updateUsage(accountKey: String, snapshot: UsageSnapshot) throws -> CodexManagedAccount {
+        try withFileLock(.exclusive) {
+            try updateUsageLocked(accountKey: accountKey, snapshot: snapshot)
+        }
+    }
+
+    private func updateUsageLocked(
+        accountKey: String,
+        snapshot: UsageSnapshot
+    ) throws -> CodexManagedAccount {
         var registry = try loadRegistryFile()
         guard let index = registry.accounts.firstIndex(where: { $0.accountKey == accountKey }) else {
             throw CodexUsageAccountStoreError.accountNotFound
@@ -264,7 +921,10 @@ struct CodexUsageAccountStore {
             )
         }
 
-        let data = try Data(contentsOf: registryFileURL)
+        let data = try readSizeLimitedData(
+            at: registryFileURL,
+            maximumByteCount: Self.maximumRegistryByteCount
+        )
         let decoder = JSONDecoder()
         let decoded: ManagedAccountsRegistryFile
         do {
@@ -276,17 +936,68 @@ struct CodexUsageAccountStore {
         guard decoded.schemaVersion > 0 && decoded.schemaVersion <= Self.maxSupportedSchemaVersion else {
             throw CodexUsageAccountStoreError.unsupportedSchema(decoded.schemaVersion)
         }
+        try validateRegistry(decoded)
         return decoded
     }
 
+    private func storageRevisionLocked() throws -> String {
+        var hasher = SHA256()
+
+        func update(_ data: Data, in hasher: inout SHA256) {
+            var byteCount = UInt64(data.count).bigEndian
+            Swift.withUnsafeBytes(of: &byteCount) { bytes in
+                hasher.update(data: Data(bytes))
+            }
+            hasher.update(data: data)
+        }
+
+        if FileManager.default.fileExists(atPath: registryFileURL.path) {
+            update(
+                try readSizeLimitedData(
+                    at: registryFileURL,
+                    maximumByteCount: Self.maximumRegistryByteCount
+                ),
+                in: &hasher
+            )
+        } else {
+            update(Data("missing-registry".utf8), in: &hasher)
+        }
+
+        let registry = try loadRegistryFile()
+        for account in registry.accounts.sorted(by: {
+            $0.accountKey < $1.accountKey
+        }) {
+            update(Data(account.accountKey.utf8), in: &hasher)
+            let authURL = try authFileURL(for: account.accountKey)
+            if FileManager.default.fileExists(atPath: authURL.path) {
+                update(
+                    try readSizeLimitedData(
+                        at: authURL,
+                        maximumByteCount: Self.maximumAuthSnapshotByteCount
+                    ),
+                    in: &hasher
+                )
+            } else {
+                update(Data("missing-auth".utf8), in: &hasher)
+            }
+        }
+
+        return hasher.finalize().map {
+            String(format: "%02x", $0)
+        }.joined()
+    }
+
     private func saveRegistryFile(_ registry: ManagedAccountsRegistryFile) throws {
+        try validateRegistry(registry)
         try ensureAccountsDirectory()
 
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let data = try encoder.encode(registry)
-        try data.write(to: registryFileURL, options: .atomic)
-        try Self.setOwnerOnlyPermissions(registryFileURL)
+        guard data.count <= Self.maximumRegistryByteCount else {
+            throw CodexUsageAccountStoreError.archiveTooLarge
+        }
+        try OwnerOnlyFileWriter.write(data, to: registryFileURL)
     }
 
     private func upsert(_ record: ManagedAccountRecord, in registry: inout ManagedAccountsRegistryFile) {
@@ -311,10 +1022,57 @@ struct CodexUsageAccountStore {
     private func replaceActiveAuthThenSaveRegistry(
         sourceAuthURL: URL,
         registry: ManagedAccountsRegistryFile,
-        keyForLog accountKey: String
+        keyForLog accountKey: String,
+        credentialAuthority: ReplacementCredentialAuthority
     ) throws {
         let previousActiveAuthData = try authSnapshotDataIfExists(at: activeAuthFileURL)
-        try backupActiveAuthIfChanged(sourceAuthURL: sourceAuthURL)
+        if let previousActiveAuthData {
+            let activeAccountInfo: CodexOAuthAccountInfo
+            do {
+                activeAccountInfo = try CodexOAuthCredentialsStore
+                    .load(from: previousActiveAuthData)
+                    .accountInfo()
+            } catch {
+                throw CodexUsageAccountStoreError.activeAuthCannotBeReplaced(
+                    "The current ~/.codex/auth.json could not be identified, so Codex Usage left it unchanged."
+                )
+            }
+            guard registryContainsIdentity(activeAccountInfo, in: registry) else {
+                throw CodexUsageAccountStoreError.activeAuthCannotBeReplaced(
+                    "The current ~/.codex/auth.json belongs to an account that Codex Usage does not manage, so it was left unchanged."
+                )
+            }
+
+            if activeAccountInfo.accountKey == accountKey,
+               credentialAuthority == .currentActiveAuth
+            {
+                let previousSourceData = try authSnapshotDataIfExists(
+                    at: sourceAuthURL
+                )
+                try OwnerOnlyFileWriter.write(
+                    previousActiveAuthData,
+                    to: sourceAuthURL
+                )
+                do {
+                    try saveRegistryFile(registry)
+                } catch {
+                    try restoreAuthSnapshotAfterFailure(
+                        at: sourceAuthURL,
+                        previousData: previousSourceData,
+                        keyForLog: accountKey
+                    )
+                    throw error
+                }
+                Self.logger.info("active auth already matched requested account; captured latest credentials without replacement key_fp=\(LogFingerprint.account(accountKey), privacy: .public)")
+                return
+            }
+
+            try captureLatestActiveAuthBeforeReplacement(
+                previousActiveAuthData,
+                excludingAccountKey: accountKey,
+                registry: registry
+            )
+        }
         try replaceActiveAuth(with: sourceAuthURL)
 
         do {
@@ -332,7 +1090,32 @@ struct CodexUsageAccountStore {
 
     private func authSnapshotDataIfExists(at url: URL) throws -> Data? {
         guard FileManager.default.fileExists(atPath: url.path) else { return nil }
-        return try Data(contentsOf: url)
+        return try readSizeLimitedData(
+            at: url,
+            maximumByteCount: Self.maximumAuthSnapshotByteCount
+        )
+    }
+
+    private func readSizeLimitedData(
+        at url: URL,
+        maximumByteCount: Int
+    ) throws -> Data {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+
+        var data = Data()
+        let chunkByteCount = 64 * 1_024
+        while data.count <= maximumByteCount {
+            let remaining = maximumByteCount + 1 - data.count
+            let chunk = try handle.read(
+                upToCount: min(chunkByteCount, remaining)
+            ) ?? Data()
+            if chunk.isEmpty {
+                return data
+            }
+            data.append(chunk)
+        }
+        throw CodexUsageAccountStoreError.archiveTooLarge
     }
 
     private func restoreAuthSnapshotAfterFailure(
@@ -350,8 +1133,7 @@ struct CodexUsageAccountStore {
 
     private func restoreAuthSnapshot(at url: URL, previousData: Data?) throws {
         if let previousData {
-            try previousData.write(to: url, options: .atomic)
-            try Self.setOwnerOnlyPermissions(url)
+            try OwnerOnlyFileWriter.write(previousData, to: url)
         } else if FileManager.default.fileExists(atPath: url.path) {
             try FileManager.default.removeItem(at: url)
         }
@@ -366,37 +1148,107 @@ struct CodexUsageAccountStore {
         Self.logger.info("restored active auth after registry save failure")
     }
 
-    private func backupActiveAuthIfChanged(sourceAuthURL: URL) throws {
-        guard FileManager.default.fileExists(atPath: activeAuthFileURL.path) else { return }
+    private func captureLatestActiveAuthBeforeReplacement(
+        _ activeData: Data,
+        excludingAccountKey: String,
+        registry: ManagedAccountsRegistryFile
+    ) throws {
+        let credentials: CodexOAuthCredentials
+        let accountInfo: CodexOAuthAccountInfo
+        do {
+            credentials = try CodexOAuthCredentialsStore.load(from: activeData)
+            accountInfo = try credentials.accountInfo()
+        } catch {
+            Self.logger.info("final active auth capture skipped reason=unreadable_active_auth error_type=\(LogErrorSummary.category(error), privacy: .public) error=\(error.localizedDescription, privacy: .private)")
+            return
+        }
 
-        let current = try Data(contentsOf: activeAuthFileURL)
-        let next = try Data(contentsOf: sourceAuthURL)
-        guard current != next else { return }
+        guard accountInfo.accountKey != excludingAccountKey,
+              registryContainsIdentity(accountInfo, in: registry)
+        else {
+            return
+        }
 
+        let managedAuthURL = try authFileURL(for: accountInfo.accountKey)
+        if try authSnapshotDataIfExists(at: managedAuthURL) == activeData {
+            return
+        }
         try ensureAccountsDirectory()
-        let backupURL = accountsDirectoryURL.appendingPathComponent("auth.json.bak")
-        try current.write(to: backupURL, options: .atomic)
-        try Self.setOwnerOnlyPermissions(backupURL)
-        Self.logger.info("backed up active auth to \(backupURL.lastPathComponent, privacy: .public)")
+        try OwnerOnlyFileWriter.write(activeData, to: managedAuthURL)
+        Self.logger.info("captured latest active auth immediately before replacement active_fp=\(LogFingerprint.account(accountInfo.accountKey), privacy: .public) active=\(accountInfo.accountKey, privacy: .private)")
+    }
+
+    private func registryContainsIdentity(
+        _ accountInfo: CodexOAuthAccountInfo,
+        in registry: ManagedAccountsRegistryFile
+    ) -> Bool {
+        registry.accounts.contains {
+            $0.accountKey == accountInfo.accountKey
+                && $0.chatgptAccountID == accountInfo.chatgptAccountID
+                && $0.chatgptUserID == accountInfo.chatgptUserID
+        }
     }
 
     private func replaceActiveAuth(with sourceAuthURL: URL) throws {
-        let data = try Data(contentsOf: sourceAuthURL)
+        let data = try readSizeLimitedData(
+            at: sourceAuthURL,
+            maximumByteCount: Self.maximumAuthSnapshotByteCount
+        )
         try FileManager.default.createDirectory(
             at: activeAuthFileURL.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
-        try data.write(to: activeAuthFileURL, options: .atomic)
-        try Self.setOwnerOnlyPermissions(activeAuthFileURL)
+        try OwnerOnlyFileWriter.write(data, to: activeAuthFileURL)
         Self.logger.info("replaced active auth source=\(sourceAuthURL.path, privacy: .private) target=\(activeAuthFileURL.path, privacy: .private)")
     }
 
     private func ensureAccountsDirectory() throws {
+        try ensureApplicationSupportDirectory()
         try FileManager.default.createDirectory(
             at: accountsDirectoryURL,
             withIntermediateDirectories: true
         )
         try Self.setOwnerOnlyDirectoryPermissions(accountsDirectoryURL)
+    }
+
+    private func ensureApplicationSupportDirectory() throws {
+        try FileManager.default.createDirectory(
+            at: applicationSupportURL,
+            withIntermediateDirectories: true
+        )
+        try Self.setOwnerOnlyDirectoryPermissions(applicationSupportURL)
+    }
+
+    private func withFileLock<T>(
+        _ mode: FileLockMode,
+        operation: () throws -> T
+    ) throws -> T {
+        try ensureApplicationSupportDirectory()
+        let descriptor = Darwin.open(
+            lockFileURL.path,
+            O_CREAT | O_RDWR,
+            S_IRUSR | S_IWUSR
+        )
+        guard descriptor >= 0 else {
+            throw CodexUsageAccountStoreError.lockFailed(
+                POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO).localizedDescription
+            )
+        }
+        defer { Darwin.close(descriptor) }
+
+        guard fchmod(descriptor, S_IRUSR | S_IWUSR) == 0 else {
+            throw CodexUsageAccountStoreError.lockFailed(
+                POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO).localizedDescription
+            )
+        }
+        guard flock(descriptor, mode.operation) == 0 else {
+            throw CodexUsageAccountStoreError.lockFailed(
+                POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO).localizedDescription
+            )
+        }
+        defer { flock(descriptor, LOCK_UN) }
+
+        return try operation()
     }
 
     private static func defaultApplicationSupportURL() -> URL {
@@ -441,13 +1293,6 @@ struct CodexUsageAccountStore {
             .replacingOccurrences(of: "=", with: "")
     }
 
-    private static func setOwnerOnlyPermissions(_ url: URL) throws {
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o600],
-            ofItemAtPath: url.path
-        )
-    }
-
     private static func setOwnerOnlyDirectoryPermissions(_ url: URL) throws {
         try FileManager.default.setAttributes(
             [.posixPermissions: 0o700],
@@ -458,6 +1303,7 @@ struct CodexUsageAccountStore {
 
 enum CodexUsageAccountStoreError: LocalizedError {
     case authSnapshotNotFound(String)
+    case authSnapshotAccountMismatch(expected: String, actual: String)
     case unsupportedSchema(Int)
     case decodeFailed(String)
     case accountNotFound
@@ -465,11 +1311,20 @@ enum CodexUsageAccountStoreError: LocalizedError {
     case activeAccountCannotBeRemoved
     case activeAuthRestoreFailed(String)
     case authSnapshotRestoreFailed(String)
+    case lockFailed(String)
+    case archiveInvalid(String)
+    case archiveTooLarge
+    case importCommitFailed(String)
+    case activeAuthCannotBeReplaced(String)
+    case managedAuthRefreshConflict
+    case storageChangedSinceImportPreview
 
     var errorDescription: String? {
         switch self {
         case .authSnapshotNotFound(let path):
             return "Managed account auth snapshot was not found at \(path)."
+        case .authSnapshotAccountMismatch:
+            return "Managed account auth snapshot belongs to a different account. Add the account again."
         case .unsupportedSchema(let version):
             return "Codex Usage account registry schema \(version) is newer than this app supports."
         case .decodeFailed(let message):
@@ -484,6 +1339,20 @@ enum CodexUsageAccountStoreError: LocalizedError {
             return "Could not restore the previous active Codex auth after a failed account update: \(message)"
         case .authSnapshotRestoreFailed(let message):
             return "Could not restore the managed account auth snapshot after a failed account update: \(message)"
+        case .lockFailed(let message):
+            return "Could not lock Codex Usage managed account storage: \(message)"
+        case .archiveInvalid(let message):
+            return "The Codex Usage account archive is invalid. \(message)"
+        case .archiveTooLarge:
+            return "The Codex Usage account archive exceeds the supported size limit."
+        case .importCommitFailed(let message):
+            return "Could not replace the managed account configuration: \(message)"
+        case .activeAuthCannotBeReplaced(let message):
+            return message
+        case .managedAuthRefreshConflict:
+            return "Managed account credentials changed while quota was refreshing. Refresh the account again."
+        case .storageChangedSinceImportPreview:
+            return "Managed accounts changed after the import preview. Open the backup again and review the updated replacement summary."
         }
     }
 }
@@ -626,7 +1495,9 @@ private struct ManagedRateLimitWindow: Codable {
     init(window: QuotaWindow) {
         self.usedPercent = window.usedPercent
         self.windowMinutes = window.windowDurationMins
-        self.resetsAt = window.resetsAt.map { Int64($0.timeIntervalSince1970) }
+        self.resetsAt = window.resetsAt.flatMap {
+            SafeNumericConversions.truncatingInt64($0.timeIntervalSince1970)
+        }
     }
 
     func quotaWindow(role: String) -> QuotaWindow? {

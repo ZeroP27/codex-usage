@@ -26,7 +26,7 @@ struct UsageSnapshot: Equatable, Sendable {
     }
 }
 
-enum CodexUsageDataSource: String, CaseIterable, Identifiable, Sendable {
+enum CodexUsageDataSource: String, CaseIterable, Codable, Identifiable, Sendable {
     case oauthAPI = "oauthAPI"
     case cliRPC = "cliRPC"
 
@@ -51,7 +51,7 @@ enum CodexUsageDataSource: String, CaseIterable, Identifiable, Sendable {
     }
 }
 
-enum CodexRefreshInterval: Int, CaseIterable, Identifiable, Sendable {
+enum CodexRefreshInterval: Int, CaseIterable, Codable, Identifiable, Sendable {
     case oneMinute = 60
     case twoMinutes = 120
     case fiveMinutes = 300

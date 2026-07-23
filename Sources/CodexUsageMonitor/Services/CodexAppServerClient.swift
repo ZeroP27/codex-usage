@@ -190,12 +190,12 @@ struct CodexAppServerClient {
         }
 
         do {
-            try Self.openAuthenticationURL(authURL)
+            try openAuthenticationURL(authURL)
         } catch {
             Self.logger.error("chatgpt login failed to open chrome incognito auth_url_host=\(authURL.host ?? "missing", privacy: .public) error_type=\(LogErrorSummary.category(error), privacy: .public) error=\(error.localizedDescription, privacy: .private)")
             throw error
         }
-        Self.logger.info("chatgpt login opened chrome incognito auth_url_host=\(authURL.host ?? "missing", privacy: .public)")
+        Self.logger.info("chatgpt login requested chrome incognito auth_url_host=\(authURL.host ?? "missing", privacy: .public)")
 
         let completed = try rpc.waitForNotification(
             method: "account/login/completed",
@@ -243,27 +243,34 @@ struct CodexAppServerClient {
         return environment
     }
 
-    private static func openAuthenticationURL(_ url: URL) throws {
-        guard chromeApplicationURL() != nil else {
+    private func openAuthenticationURL(_ url: URL) throws {
+        guard Self.chromeApplicationURL() != nil else {
             throw CodexAppServerError.loginFailed("Google Chrome is required to open the ChatGPT login in an incognito window.")
         }
-        guard FileManager.default.isExecutableFile(atPath: openToolURL.path) else {
+        guard FileManager.default.isExecutableFile(atPath: Self.openToolURL.path) else {
             throw CodexAppServerError.loginFailed("Could not find /usr/bin/open to launch Chrome.")
         }
 
         let process = Process()
-        process.executableURL = openToolURL
-        process.arguments = chromeIncognitoOpenArguments(for: url)
+        process.executableURL = Self.openToolURL
+        process.arguments = Self.chromeIncognitoOpenArguments(for: url)
+        Self.logger.info("requesting chrome incognito login requested_new_instance=true auth_url_host=\(url.host ?? "missing", privacy: .public)")
 
         let errorPipe = Pipe()
         process.standardError = errorPipe
+        let terminated = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in terminated.signal() }
 
         do {
             try process.run()
         } catch {
             throw CodexAppServerError.loginFailed("Could not launch Chrome incognito login window: \(error.localizedDescription)")
         }
-        process.waitUntilExit()
+        guard terminated.wait(timeout: .now() + timeout) == .success else {
+            Self.stop(process)
+            throw CodexAppServerError.loginFailed("Timed out while asking macOS to open Chrome.")
+        }
+        Self.logger.info("chrome incognito open request completed status=\(process.terminationStatus, privacy: .public)")
 
         guard process.terminationStatus == 0 else {
             let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
@@ -276,6 +283,7 @@ struct CodexAppServerClient {
 
     static func chromeIncognitoOpenArguments(for url: URL) -> [String] {
         [
+            "-n",
             "-b",
             chromeBundleIdentifier,
             "--args",
@@ -371,7 +379,7 @@ struct CodexAppServerClient {
         ].compactMap { role, window in
             guard let window else { return nil }
             guard let usedPercent = window.usedPercent else { return nil }
-            guard let duration = window.windowDurationMins else { return nil }
+            guard let duration = window.windowDurationMins, duration > 0 else { return nil }
 
             let limitID = snapshot.limitId ?? "codex"
             let resetDate = window.resetsAt.map {
@@ -422,7 +430,7 @@ enum CodexAppServerError: LocalizedError {
     }
 }
 
-private enum CodexExecutableResolver {
+enum CodexExecutableResolver {
     static func resolve(_ configuredPath: String) throws -> URL {
         let configured = configuredPath.trimmingCharacters(in: .whitespacesAndNewlines)
         if configured.contains("/") {
@@ -446,15 +454,20 @@ private enum CodexExecutableResolver {
         throw CodexAppServerError.executableNotFound(configured)
     }
 
-    private static func candidates(named executableName: String) -> [URL] {
+    static func candidates(named executableName: String) -> [URL] {
         let home = FileManager.default.homeDirectoryForCurrentUser
-        var paths = [
-            "/Applications/Codex.app/Contents/Resources/codex",
-            home.appendingPathComponent("Applications/Codex.app/Contents/Resources/codex").path,
+        var paths: [String] = []
+        if executableName == "codex" {
+            paths.append(contentsOf: [
+                "/Applications/Codex.app/Contents/Resources/codex",
+                home.appendingPathComponent("Applications/Codex.app/Contents/Resources/codex").path
+            ])
+        }
+        paths.append(contentsOf: [
             "/opt/homebrew/bin/\(executableName)",
             "/usr/local/bin/\(executableName)",
             "/usr/bin/\(executableName)"
-        ]
+        ])
 
         let pathEntries = (ProcessInfo.processInfo.environment["PATH"] ?? "")
             .split(separator: ":")
@@ -473,7 +486,11 @@ private enum CodexExecutableResolver {
     }
 }
 
-private final class AppServerRPCConnection: @unchecked Sendable {
+final class AppServerRPCConnection: @unchecked Sendable {
+    private static let maximumOutputBufferByteCount = 1_024 * 1_024
+    private static let maximumMessageByteCount = 256 * 1_024
+    private static let maximumQueuedMessageCount = 128
+
     private let input: FileHandle
     private let output: FileHandle
     private let error: FileHandle
@@ -483,6 +500,8 @@ private final class AppServerRPCConnection: @unchecked Sendable {
     private var messages: [[String: Any]] = []
     private var errorBuffer = Data()
     private var closed = false
+    private var outputReachedEOF = false
+    private var protocolFailureMessage: String?
 
     init(input: FileHandle, output: FileHandle, error: FileHandle) {
         self.input = input
@@ -491,11 +510,17 @@ private final class AppServerRPCConnection: @unchecked Sendable {
 
         self.output.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
+            if data.isEmpty {
+                handle.readabilityHandler = nil
+            }
             self?.ingestOutput(data)
         }
 
         self.error.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
+            if data.isEmpty {
+                handle.readabilityHandler = nil
+            }
             self?.ingestError(data)
         }
     }
@@ -541,6 +566,7 @@ private final class AppServerRPCConnection: @unchecked Sendable {
             if let notification = popNotification(method: method, loginID: loginID) {
                 return notification
             }
+            try throwIfConnectionFailed()
 
             let remaining = deadline.timeIntervalSinceNow
             if remaining <= 0 {
@@ -582,7 +608,13 @@ private final class AppServerRPCConnection: @unchecked Sendable {
     private func send(message: [String: Any]) throws {
         var data = try JSONSerialization.data(withJSONObject: message)
         data.append(0x0A)
-        input.write(data)
+        do {
+            try input.write(contentsOf: data)
+        } catch {
+            throw CodexAppServerError.requestFailed(
+                "Could not write to codex app-server: \(error.localizedDescription)"
+            )
+        }
     }
 
     private func waitForResponse(id: Int, timeout: TimeInterval) throws -> [String: Any] {
@@ -592,6 +624,7 @@ private final class AppServerRPCConnection: @unchecked Sendable {
             if let response = popResponse(id: id) {
                 return response
             }
+            try throwIfConnectionFailed()
 
             let remaining = deadline.timeIntervalSinceNow
             if remaining <= 0 {
@@ -632,24 +665,50 @@ private final class AppServerRPCConnection: @unchecked Sendable {
 
     private func ingestOutput(_ data: Data) {
         guard !data.isEmpty else {
+            lock.lock()
+            outputReachedEOF = true
+            lock.unlock()
             semaphore.signal()
             return
         }
 
         lock.lock()
+        guard protocolFailureMessage == nil else {
+            lock.unlock()
+            return
+        }
+        guard data.count <= Self.maximumOutputBufferByteCount - outputBuffer.count else {
+            protocolFailureMessage = "codex app-server output exceeded the supported buffer limit."
+            outputBuffer.removeAll(keepingCapacity: false)
+            lock.unlock()
+            semaphore.signal()
+            return
+        }
         outputBuffer.append(data)
 
         while let newline = outputBuffer.firstRange(of: Data([0x0A])) {
             let line = outputBuffer.subdata(in: 0..<newline.lowerBound)
             outputBuffer.removeSubrange(0..<newline.upperBound)
             guard !line.isEmpty else { continue }
+            guard line.count <= Self.maximumMessageByteCount else {
+                protocolFailureMessage = "codex app-server sent an oversized message."
+                break
+            }
             guard let message = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else {
                 continue
+            }
+            guard messages.count < Self.maximumQueuedMessageCount else {
+                protocolFailureMessage = "codex app-server sent too many unhandled messages."
+                break
             }
             messages.append(message)
             semaphore.signal()
         }
+        let didFailProtocol = protocolFailureMessage != nil
         lock.unlock()
+        if didFailProtocol {
+            semaphore.signal()
+        }
     }
 
     private func ingestError(_ data: Data) {
@@ -667,6 +726,24 @@ private final class AppServerRPCConnection: @unchecked Sendable {
         defer { lock.unlock() }
         return String(data: errorBuffer, encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
+    private func throwIfConnectionFailed() throws {
+        lock.lock()
+        let reachedEOF = outputReachedEOF
+        let protocolFailureMessage = protocolFailureMessage
+        let errorText = String(data: errorBuffer, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        lock.unlock()
+
+        if let protocolFailureMessage {
+            throw CodexAppServerError.requestFailed(protocolFailureMessage)
+        }
+        guard reachedEOF else { return }
+        let detail = errorText.isEmpty ? "" : " \(errorText)"
+        throw CodexAppServerError.requestFailed(
+            "codex app-server closed its output before replying.\(detail)"
+        )
     }
 }
 
@@ -698,7 +775,7 @@ private struct RateLimitSnapshot: Decodable {
     var secondary: RateLimitWindowPayload?
 }
 
-private struct RateLimitWindowPayload: Decodable {
+struct RateLimitWindowPayload: Decodable {
     var usedPercent: Double?
     var windowDurationMins: Int?
     var resetsAt: Double?
@@ -721,13 +798,13 @@ private struct RateLimitWindowPayload: Decodable {
         in container: KeyedDecodingContainer<CodingKeys>) -> Double?
     {
         if let value = try? container.decode(Double.self, forKey: key) {
-            return value
+            return SafeNumericConversions.finiteDouble(value)
         }
         if let value = try? container.decode(Int.self, forKey: key) {
             return Double(value)
         }
         if let value = try? container.decode(String.self, forKey: key) {
-            return Double(value)
+            return Double(value).flatMap(SafeNumericConversions.finiteDouble)
         }
         return nil
     }
@@ -740,7 +817,7 @@ private struct RateLimitWindowPayload: Decodable {
             return value
         }
         if let value = try? container.decode(Double.self, forKey: key) {
-            return Int(value)
+            return SafeNumericConversions.exactInt(value)
         }
         if let value = try? container.decode(String.self, forKey: key) {
             return Int(value)

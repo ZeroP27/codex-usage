@@ -53,9 +53,37 @@ jobs:
             echo "tag=v$version"
           } >> "$GITHUB_OUTPUT"
 
+  test:
+    name: Test
+    runs-on: macos-26
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify test runner
+        run: |
+          set -euo pipefail
+          echo "DEVELOPER_DIR=$(xcode-select -p)" >> "$GITHUB_ENV"
+          xcrun --find xctest
+
+      - name: Discover tests
+        run: |
+          set -euo pipefail
+          swift test list | tee test-list.txt
+          test_count="$(grep -c 'CodexUsageMonitorTests' test-list.txt || true)"
+          if [[ "$test_count" -eq 0 ]]; then
+            echo "SwiftPM discovered no tests." >&2
+            exit 1
+          fi
+
+      - name: Run tests
+        run: swift test
+
   build:
     name: Build ${{ matrix.asset_label }}
-    needs: prepare
+    needs:
+      - prepare
+      - test
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -91,6 +119,7 @@ jobs:
           plist_path="$app_path/Contents/Info.plist"
 
           plutil -lint "$plist_path"
+          codesign --verify --deep --strict --verbose=2 "$app_path"
 
           bundle_version="$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$plist_path")"
           if [[ "$bundle_version" != "${{ needs.prepare.outputs.version }}" ]]; then

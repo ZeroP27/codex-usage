@@ -1,6 +1,44 @@
 import Foundation
 import OSLog
 
+enum CodexPendingRefreshKind: Equatable {
+    case current
+    case all
+
+    func merged(with incoming: CodexPendingRefreshKind) -> CodexPendingRefreshKind {
+        self == .all || incoming == .all ? .all : .current
+    }
+}
+
+struct CodexUsageLoadResult: Sendable {
+    var rows: [AccountUsageRow]
+    var activeAccountKey: String?
+    var errorMessage: String? = nil
+    var didRefreshCurrentAccount = false
+}
+
+struct CodexSingleAccountUsageLoadResult: Sendable {
+    var row: AccountUsageRow
+    var activeAccountKey: String?
+    var didRefreshCurrentAccount: Bool
+}
+
+struct CodexUsageStoreOperations: Sendable {
+    var loadCurrentManagedAccountUsage: @Sendable () async throws -> CodexUsageLoadResult
+    var loadUsage: @Sendable (
+        _ usageDataSource: CodexUsageDataSource,
+        _ codexExecutablePath: String
+    ) async throws -> CodexUsageLoadResult
+    var loadSingleUsage: @Sendable (
+        _ accountKey: String,
+        _ usageDataSource: CodexUsageDataSource,
+        _ codexExecutablePath: String
+    ) async throws -> CodexSingleAccountUsageLoadResult
+    var activateManagedAccount: @Sendable (_ accountKey: String) async throws -> Void
+    var addManagedAccount: @Sendable (_ codexExecutablePath: String) async throws -> CodexUsageLoadResult
+    var removeManagedAccount: @Sendable (_ accountKey: String) async throws -> CodexUsageLoadResult
+}
+
 @MainActor
 final class CodexUsageStore: ObservableObject {
     @Published private(set) var accountRows: [AccountUsageRow] = []
@@ -11,41 +49,14 @@ final class CodexUsageStore: ObservableObject {
     @Published private(set) var isRemovingAccount = false
     @Published private(set) var errorMessage: String?
     @Published private(set) var activeAccountKey: String?
-    @Published var usageDataSource: CodexUsageDataSource {
-        didSet {
-            UserDefaults.standard.set(usageDataSource.rawValue, forKey: Self.usageDataSourceDefaultsKey)
-            logger.info("data source changed source=\(self.usageDataSource.rawValue, privacy: .public)")
-            refresh(trigger: .settingsChange)
-        }
-    }
-    @Published var refreshInterval: CodexRefreshInterval {
-        didSet {
-            UserDefaults.standard.set(refreshInterval.rawValue, forKey: Self.refreshIntervalDefaultsKey)
-            logger.info("refresh interval changed seconds=\(self.refreshInterval.rawValue, privacy: .public)")
-            startAutoRefresh()
-        }
-    }
-    @Published var codexExecutablePath: String {
-        didSet {
-            UserDefaults.standard.set(codexExecutablePath, forKey: Self.codexExecutableDefaultsKey)
-            logger.info("codex executable path changed")
-        }
-    }
+    @Published private(set) var usageDataSource: CodexUsageDataSource
+    @Published private(set) var refreshInterval: CodexRefreshInterval
+    @Published private(set) var codexExecutablePath: String
 
     private struct FetchConfiguration: Equatable {
         var usageDataSource: CodexUsageDataSource
         var codexExecutablePath: String
-    }
-
-    private struct UsageLoadResult: Sendable {
-        var rows: [AccountUsageRow]
-        var activeAccountKey: String?
-        var errorMessage: String? = nil
-    }
-
-    private struct SingleAccountUsageLoadResult: Sendable {
-        var row: AccountUsageRow
-        var activeAccountKey: String?
+        var generation: UInt64 = 0
     }
 
     private enum RefreshTrigger: String {
@@ -59,14 +70,21 @@ final class CodexUsageStore: ObservableObject {
         case manualAccount
     }
 
+    private struct PendingRefresh {
+        var kind: CodexPendingRefreshKind
+        var trigger: RefreshTrigger
+    }
+
+    private struct CurrentAccountRefreshState {
+        var accountKey: String
+        var completedAt: Date
+    }
+
     private enum AccountUsageCredentialSource {
         case managedSnapshot
         case activeAuthReadOnly
     }
 
-    private static let usageDataSourceDefaultsKey = "usageDataSource"
-    private static let refreshIntervalDefaultsKey = "refreshInterval"
-    private static let codexExecutableDefaultsKey = "codexExecutablePath"
     private let logger = Logger(
         subsystem: "dev.idea-space.CodexUsageMonitor",
         category: "UsageStore"
@@ -75,9 +93,46 @@ final class CodexUsageStore: ObservableObject {
         subsystem: "dev.idea-space.CodexUsageMonitor",
         category: "UsageStore"
     )
+    nonisolated private static let liveOperations = CodexUsageStoreOperations(
+        loadCurrentManagedAccountUsage: {
+            try await CodexUsageStore.loadCurrentManagedAccountUsage()
+        },
+        loadUsage: { usageDataSource, codexExecutablePath in
+            try await CodexUsageStore.loadUsage(
+                configuration: FetchConfiguration(
+                    usageDataSource: usageDataSource,
+                    codexExecutablePath: codexExecutablePath
+                )
+            )
+        },
+        loadSingleUsage: { accountKey, usageDataSource, codexExecutablePath in
+            try await CodexUsageStore.loadSingleUsage(
+                accountKey: accountKey,
+                configuration: FetchConfiguration(
+                    usageDataSource: usageDataSource,
+                    codexExecutablePath: codexExecutablePath
+                )
+            )
+        },
+        activateManagedAccount: { accountKey in
+            try await CodexUsageStore.activateManagedAccount(accountKey: accountKey)
+        },
+        addManagedAccount: { codexExecutablePath in
+            try await CodexUsageStore.addManagedAccount(
+                codexExecutablePath: codexExecutablePath
+            )
+        },
+        removeManagedAccount: { accountKey in
+            try await CodexUsageStore.removeManagedAccount(accountKey: accountKey)
+        }
+    )
+    private let preferencesRepository: CodexUsagePreferencesRepository
+    private let operations: CodexUsageStoreOperations
     private var autoRefreshTask: Task<Void, Never>?
-    private var refreshRequested = false
-    private var lastRefreshCompletedAt: Date?
+    private var pendingRefresh: PendingRefresh?
+    private var currentAccountRefreshState: CurrentAccountRefreshState?
+    private var fetchGeneration: UInt64 = 0
+    private var isConfigurationTransferSuspended = false
 
     private var isAccountManagementBusy: Bool {
         isAddingAccount || isRemovingAccount || isActivatingAccount
@@ -102,22 +157,127 @@ final class CodexUsageStore: ObservableObject {
         activeUsageRow?.snapshot ?? UsageSnapshot.empty(sourceDescription: usageDataSource.title)
     }
 
-    init() {
-        let storedSource = UserDefaults.standard.string(forKey: Self.usageDataSourceDefaultsKey)
-        usageDataSource = storedSource.flatMap(CodexUsageDataSource.init(rawValue:)) ?? .oauthAPI
+    convenience init(
+        preferencesRepository: CodexUsagePreferencesRepository = CodexUsagePreferencesRepository()
+    ) {
+        self.init(
+            preferencesRepository: preferencesRepository,
+            operations: Self.liveOperations,
+            startsAutomatically: true
+        )
+    }
 
-        let storedInterval = UserDefaults.standard.integer(forKey: Self.refreshIntervalDefaultsKey)
-        refreshInterval = CodexRefreshInterval(rawValue: storedInterval) ?? .fiveMinutes
+    init(
+        preferencesRepository: CodexUsagePreferencesRepository,
+        operations: CodexUsageStoreOperations,
+        startsAutomatically: Bool
+    ) {
+        self.preferencesRepository = preferencesRepository
+        self.operations = operations
+        let preferences = preferencesRepository.load()
+        usageDataSource = preferences.usageDataSource
+        refreshInterval = preferences.refreshInterval
+        codexExecutablePath = preferences.codexExecutablePath
 
-        codexExecutablePath = UserDefaults.standard.string(forKey: Self.codexExecutableDefaultsKey)
-            ?? "codex"
-
-        refreshCurrentAccount(trigger: .appStart)
-        startAutoRefresh()
+        if startsAutomatically {
+            performStartupMaintenance()
+            refreshCurrentAccount(trigger: .appStart)
+            startAutoRefresh()
+        }
     }
 
     deinit {
         autoRefreshTask?.cancel()
+    }
+
+    var preferences: CodexUsagePreferences {
+        CodexUsagePreferences(
+            usageDataSource: usageDataSource,
+            refreshInterval: refreshInterval,
+            codexExecutablePath: codexExecutablePath
+        )
+    }
+
+    func updateUsageDataSource(_ source: CodexUsageDataSource) {
+        guard source != usageDataSource else { return }
+        do {
+            var next = preferences
+            next.usageDataSource = source
+            try persistAndApply(next, refreshReason: .settingsChange)
+            logger.info("data source changed source=\(source.rawValue, privacy: .public)")
+        } catch {
+            errorMessage = error.localizedDescription
+            logger.error("data source change failed error_type=\(LogErrorSummary.category(error), privacy: .public) error=\(error.localizedDescription, privacy: .private)")
+        }
+    }
+
+    func updateRefreshInterval(_ interval: CodexRefreshInterval) {
+        guard interval != refreshInterval else { return }
+        do {
+            var next = preferences
+            next.refreshInterval = interval
+            try preferencesRepository.save(next)
+            refreshInterval = interval
+            startAutoRefresh()
+            logger.info("refresh interval changed seconds=\(interval.rawValue, privacy: .public)")
+        } catch {
+            errorMessage = error.localizedDescription
+            logger.error("refresh interval change failed error_type=\(LogErrorSummary.category(error), privacy: .public) error=\(error.localizedDescription, privacy: .private)")
+        }
+    }
+
+    func applyImportedConfiguration(
+        _ imported: CodexUsagePreferences,
+        accountsSnapshot: CodexManagedAccountsSnapshot
+    ) throws {
+        let validated = try imported.validated()
+        try preferencesRepository.save(validated)
+        usageDataSource = validated.usageDataSource
+        refreshInterval = validated.refreshInterval
+        codexExecutablePath = validated.codexExecutablePath
+        fetchGeneration &+= 1
+        pendingRefresh = nil
+        currentAccountRefreshState = nil
+        errorMessage = nil
+
+        if validated.usageDataSource == .oauthAPI {
+            let stored = Self.storedRows(from: accountsSnapshot)
+            accountRows = stored.rows
+            activeAccountKey = stored.activeAccountKey
+            reconcileActiveAccount()
+        } else {
+            accountRows = []
+            activeAccountKey = nil
+        }
+        startAutoRefresh()
+        logger.info("imported preferences applied source=\(validated.usageDataSource.rawValue, privacy: .public) refresh_seconds=\(validated.refreshInterval.rawValue, privacy: .public)")
+    }
+
+    @discardableResult
+    func beginConfigurationTransfer() -> Bool {
+        guard !isConfigurationTransferSuspended else {
+            logger.info("configuration transfer suspension ignored reason=already_suspended")
+            return false
+        }
+        guard !isRefreshing && !isAccountManagementBusy else {
+            logger.info("configuration transfer suspension rejected reason=store_busy")
+            return false
+        }
+
+        isConfigurationTransferSuspended = true
+        fetchGeneration &+= 1
+        pendingRefresh = nil
+        autoRefreshTask?.cancel()
+        autoRefreshTask = nil
+        logger.info("configuration transfer suspension started")
+        return true
+    }
+
+    func endConfigurationTransfer() {
+        guard isConfigurationTransferSuspended else { return }
+        isConfigurationTransferSuspended = false
+        startAutoRefresh()
+        logger.info("configuration transfer suspension ended")
     }
 
     func refresh() {
@@ -133,6 +293,10 @@ final class CodexUsageStore: ObservableObject {
     }
 
     private func refreshCurrentAccount(trigger: RefreshTrigger) {
+        guard !isConfigurationTransferSuspended else {
+            logger.info("current account refresh ignored during configuration transfer trigger=\(trigger.rawValue, privacy: .public)")
+            return
+        }
         if usageDataSource == .oauthAPI {
             refreshStoredCurrentAccount(trigger: trigger)
             return
@@ -151,92 +315,117 @@ final class CodexUsageStore: ObservableObject {
 
     private func refreshStoredCurrentAccount(trigger: RefreshTrigger) {
         logger.info("stored current account refresh requested trigger=\(trigger.rawValue, privacy: .public)")
-        guard !blockRefreshIfAccountManagementIsBusy(trigger: trigger) else { return }
+        guard !blockRefreshIfAccountManagementIsBusy(trigger: trigger) else {
+            enqueueRefresh(.current, trigger: trigger)
+            return
+        }
         guard !isRefreshing else {
-            refreshRequested = true
+            enqueueRefresh(.current, trigger: trigger)
             logger.info("stored current account refresh queued trigger=\(trigger.rawValue, privacy: .public)")
             return
         }
 
         isRefreshing = true
-        refreshRequested = false
         let configuration = currentFetchConfiguration
 
         Task {
             do {
-                let result = try await Self.loadCurrentManagedAccountUsage()
+                let result = try await operations.loadCurrentManagedAccountUsage()
                 if configuration == currentFetchConfiguration {
                     accountRows = result.rows
                     activeAccountKey = result.activeAccountKey
                     reconcileActiveAccount()
                     errorMessage = result.errorMessage
-                    lastRefreshCompletedAt = Date()
+                    if result.didRefreshCurrentAccount,
+                       let activeAccountKey
+                    {
+                        currentAccountRefreshState = CurrentAccountRefreshState(
+                            accountKey: activeAccountKey,
+                            completedAt: Date()
+                        )
+                    }
                     logger.info("stored current account refresh completed rows=\(result.rows.count, privacy: .public)")
                 } else {
-                    refreshRequested = true
+                    logger.info("discarded stale current-account refresh result")
                 }
             } catch {
                 if configuration == currentFetchConfiguration {
                     errorMessage = error.localizedDescription
                     logger.error("stored current account refresh failed error_type=\(LogErrorSummary.category(error), privacy: .public) error=\(error.localizedDescription, privacy: .private)")
                 } else {
-                    refreshRequested = true
+                    logger.info("discarded stale current-account refresh error")
                 }
             }
 
             isRefreshing = false
-            if refreshRequested {
-                refreshCurrentAccount(trigger: trigger)
-            }
+            runPendingRefreshIfPossible()
         }
     }
 
     private func refresh(trigger: RefreshTrigger) {
         logger.info("refresh requested trigger=\(trigger.rawValue, privacy: .public) source=\(self.usageDataSource.rawValue, privacy: .public)")
-        guard !blockRefreshIfAccountManagementIsBusy(trigger: trigger) else { return }
+        guard !isConfigurationTransferSuspended else {
+            logger.info("refresh ignored during configuration transfer trigger=\(trigger.rawValue, privacy: .public)")
+            return
+        }
+        guard !blockRefreshIfAccountManagementIsBusy(trigger: trigger) else {
+            enqueueRefresh(.all, trigger: trigger)
+            return
+        }
         guard !isRefreshing else {
-            refreshRequested = true
+            enqueueRefresh(.all, trigger: trigger)
             logger.info("refresh queued trigger=\(trigger.rawValue, privacy: .public)")
             return
         }
 
         isRefreshing = true
         isRefreshingAll = true
-        refreshRequested = false
         let configuration = currentFetchConfiguration
 
         Task {
             do {
-                let result = try await Self.loadUsage(configuration: configuration)
+                let result = try await operations.loadUsage(
+                    configuration.usageDataSource,
+                    configuration.codexExecutablePath
+                )
                 if configuration == currentFetchConfiguration {
                     accountRows = result.rows
                     activeAccountKey = result.activeAccountKey
                     reconcileActiveAccount()
                     errorMessage = result.errorMessage
-                    lastRefreshCompletedAt = Date()
+                    if result.didRefreshCurrentAccount,
+                       let activeAccountKey
+                    {
+                        currentAccountRefreshState = CurrentAccountRefreshState(
+                            accountKey: activeAccountKey,
+                            completedAt: Date()
+                        )
+                    }
                     logger.info("refresh completed rows=\(result.rows.count, privacy: .public)")
                 } else {
-                    refreshRequested = true
+                    logger.info("discarded stale all-account refresh result")
                 }
             } catch {
                 if configuration == currentFetchConfiguration {
                     errorMessage = error.localizedDescription
                     logger.error("refresh failed error_type=\(LogErrorSummary.category(error), privacy: .public) error=\(error.localizedDescription, privacy: .private)")
                 } else {
-                    refreshRequested = true
+                    logger.info("discarded stale all-account refresh error")
                 }
             }
 
             isRefreshingAll = false
             isRefreshing = false
-            if refreshRequested {
-                refresh(trigger: trigger)
-            }
+            runPendingRefreshIfPossible()
         }
     }
 
     private func refreshAccount(accountKey: String, trigger: RefreshTrigger) {
         logger.info("account refresh requested trigger=\(trigger.rawValue, privacy: .public) key=\(accountKey, privacy: .private)")
+        guard !isConfigurationTransferSuspended else {
+            logger.info("account refresh ignored during configuration transfer trigger=\(trigger.rawValue, privacy: .public) key=\(accountKey, privacy: .private)")
+            return
+        }
         guard !blockRefreshIfAccountManagementIsBusy(trigger: trigger) else { return }
         guard !isRefreshing else {
             logger.info("account refresh ignored because another refresh is active key=\(accountKey, privacy: .private)")
@@ -244,64 +433,85 @@ final class CodexUsageStore: ObservableObject {
         }
 
         isRefreshing = true
-        refreshRequested = false
         setAccountRefreshing(accountKey: accountKey, isRefreshing: true)
         let configuration = currentFetchConfiguration
 
         Task {
             do {
-                let result = try await Self.loadSingleUsage(
-                    accountKey: accountKey,
-                    configuration: configuration
+                let result = try await operations.loadSingleUsage(
+                    accountKey,
+                    configuration.usageDataSource,
+                    configuration.codexExecutablePath
                 )
                 if configuration == currentFetchConfiguration {
                     replaceAccountRow(result.row, activeAccountKey: result.activeAccountKey)
                     errorMessage = result.row.errorMessage
-                    lastRefreshCompletedAt = Date()
+                    if result.didRefreshCurrentAccount,
+                       let activeAccountKey = result.activeAccountKey
+                    {
+                        currentAccountRefreshState = CurrentAccountRefreshState(
+                            accountKey: activeAccountKey,
+                            completedAt: Date()
+                        )
+                    }
                     logger.info("account refresh completed key=\(accountKey, privacy: .private)")
                 } else {
-                    refreshRequested = true
+                    logger.info("discarded stale single-account refresh result key=\(accountKey, privacy: .private)")
                 }
             } catch {
                 if configuration == currentFetchConfiguration {
                     errorMessage = error.localizedDescription
                     logger.error("account refresh failed error_type=\(LogErrorSummary.category(error), privacy: .public) error=\(error.localizedDescription, privacy: .private)")
                 } else {
-                    refreshRequested = true
+                    logger.info("discarded stale single-account refresh error key=\(accountKey, privacy: .private)")
                 }
             }
 
             setAccountRefreshing(accountKey: accountKey, isRefreshing: false)
             isRefreshing = false
-            if refreshRequested {
-                refresh(trigger: trigger)
-            }
+            runPendingRefreshIfPossible()
         }
     }
 
     func refreshIfStale() {
         guard !isRefreshing else { return }
-        guard let lastRefreshCompletedAt else {
+        guard let currentAccountKey,
+              let currentAccountRefreshState,
+              currentAccountRefreshState.accountKey == currentAccountKey
+        else {
             refreshCurrentAccount(trigger: .staleMenuOpen)
             return
         }
-        if Date().timeIntervalSince(lastRefreshCompletedAt) >= TimeInterval(refreshInterval.rawValue) {
+        if Date().timeIntervalSince(currentAccountRefreshState.completedAt)
+            >= TimeInterval(refreshInterval.rawValue)
+        {
             refreshCurrentAccount(trigger: .staleMenuOpen)
         }
     }
 
     func updateCodexExecutablePath(_ path: String) {
         let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
-        codexExecutablePath = trimmed.isEmpty ? "codex" : trimmed.expandingTildeInPath
-        refresh(trigger: .pathChange)
+        var next = preferences
+        next.codexExecutablePath = trimmed.isEmpty ? "codex" : trimmed
+        do {
+            try persistAndApply(next, refreshReason: .pathChange)
+            logger.info("codex executable path changed")
+        } catch {
+            errorMessage = error.localizedDescription
+            logger.error("codex executable path change failed error_type=\(LogErrorSummary.category(error), privacy: .public) error=\(error.localizedDescription, privacy: .private)")
+        }
     }
 
     func resetCodexExecutablePath() {
-        codexExecutablePath = "codex"
-        refresh(trigger: .pathChange)
+        updateCodexExecutablePath("codex")
     }
 
     func activateAccount(_ accountKey: String) {
+        guard !isConfigurationTransferSuspended else {
+            errorMessage = "Finish or cancel the configuration import before switching accounts."
+            logger.info("account activation blocked during configuration transfer key=\(accountKey, privacy: .private)")
+            return
+        }
         guard usageDataSource == .oauthAPI else {
             errorMessage = "Account switching is available only for managed accounts."
             return
@@ -319,13 +529,14 @@ final class CodexUsageStore: ObservableObject {
         }
 
         isActivatingAccount = true
-        refreshRequested = false
         let configuration = currentFetchConfiguration
         logger.info("account activation requested key=\(accountKey, privacy: .private)")
 
         Task {
+            var activationSucceeded = false
             do {
-                try await Self.activateManagedAccount(accountKey: accountKey)
+                try await operations.activateManagedAccount(accountKey)
+                activationSucceeded = true
                 if configuration == currentFetchConfiguration {
                     activeAccountKey = accountKey
                     accountRows = accountRows.map { row in
@@ -336,27 +547,31 @@ final class CodexUsageStore: ObservableObject {
                     errorMessage = nil
                     logger.info("account activation completed key=\(accountKey, privacy: .private)")
                 } else {
-                    refreshRequested = true
+                    logger.info("discarded stale account activation result key=\(accountKey, privacy: .private)")
                 }
             } catch {
                 if configuration == currentFetchConfiguration {
                     errorMessage = error.localizedDescription
                     logger.error("account activation failed error_type=\(LogErrorSummary.category(error), privacy: .public) error=\(error.localizedDescription, privacy: .private)")
                 } else {
-                    refreshRequested = true
+                    logger.info("discarded stale account activation error key=\(accountKey, privacy: .private)")
                 }
             }
 
             isActivatingAccount = false
-            if refreshRequested {
-                refresh(trigger: .settingsChange)
-            } else {
-                refreshCurrentAccount(trigger: .accountSwitch)
+            if activationSucceeded, configuration == currentFetchConfiguration {
+                enqueueRefresh(.current, trigger: .accountSwitch)
             }
+            runPendingRefreshIfPossible()
         }
     }
 
     func addAccount() {
+        guard !isConfigurationTransferSuspended else {
+            errorMessage = "Finish or cancel the configuration import before adding an account."
+            logger.info("account login blocked during configuration transfer")
+            return
+        }
         guard usageDataSource == .oauthAPI else {
             errorMessage = "Account login is available only for managed accounts."
             return
@@ -369,7 +584,6 @@ final class CodexUsageStore: ObservableObject {
         }
 
         isAddingAccount = true
-        refreshRequested = false
         errorMessage = nil
         let executablePath = codexExecutablePath
         let configuration = currentFetchConfiguration
@@ -377,34 +591,44 @@ final class CodexUsageStore: ObservableObject {
 
         Task {
             do {
-                let result = try await Self.addManagedAccount(codexExecutablePath: executablePath)
+                let result = try await operations.addManagedAccount(executablePath)
                 if configuration == currentFetchConfiguration {
                     accountRows = result.rows
                     activeAccountKey = result.activeAccountKey
                     reconcileActiveAccount()
-                    errorMessage = nil
-                    lastRefreshCompletedAt = Date()
+                    errorMessage = result.errorMessage
+                    if result.didRefreshCurrentAccount,
+                       let activeAccountKey
+                    {
+                        currentAccountRefreshState = CurrentAccountRefreshState(
+                            accountKey: activeAccountKey,
+                            completedAt: Date()
+                        )
+                    }
                     logger.info("account login completed rows=\(result.rows.count, privacy: .public)")
                 } else {
-                    refreshRequested = true
+                    logger.info("discarded stale account login result")
                 }
             } catch {
-                if executablePath == codexExecutablePath {
+                if configuration == currentFetchConfiguration {
                     errorMessage = error.localizedDescription
                     logger.error("account login failed error_type=\(LogErrorSummary.category(error), privacy: .public) error=\(error.localizedDescription, privacy: .private)")
                 } else {
-                    refreshRequested = true
+                    logger.info("discarded stale account login error")
                 }
             }
 
             isAddingAccount = false
-            if refreshRequested {
-                refresh(trigger: .settingsChange)
-            }
+            runPendingRefreshIfPossible()
         }
     }
 
     func removeAccount(_ accountKey: String) {
+        guard !isConfigurationTransferSuspended else {
+            errorMessage = "Finish or cancel the configuration import before removing an account."
+            logger.info("account removal blocked during configuration transfer key=\(accountKey, privacy: .private)")
+            return
+        }
         guard usageDataSource == .oauthAPI else {
             errorMessage = "Account removal is available only for managed accounts."
             return
@@ -422,35 +646,46 @@ final class CodexUsageStore: ObservableObject {
         }
 
         isRemovingAccount = true
-        refreshRequested = false
         let configuration = currentFetchConfiguration
+        let previousActiveAccountKey = activeAccountKey
+        let previousErrorMessage = errorMessage
         logger.info("account removal requested key=\(accountKey, privacy: .private)")
 
         Task {
             do {
-                let result = try await Self.removeManagedAccount(accountKey: accountKey)
+                let result = try await operations.removeManagedAccount(accountKey)
                 if configuration == currentFetchConfiguration {
-                    accountRows = result.rows
+                    let previousRows = Dictionary(
+                        uniqueKeysWithValues: accountRows.map { ($0.id, $0) }
+                    )
+                    accountRows = result.rows.map { resultRow in
+                        previousRows[resultRow.id] ?? resultRow
+                    }
                     activeAccountKey = result.activeAccountKey
                     reconcileActiveAccount()
-                    errorMessage = nil
+                    accountRows = accountRows.map { row in
+                        var next = row
+                        next.account.isActive = next.id == activeAccountKey
+                        return next
+                    }
+                    errorMessage = activeAccountKey == previousActiveAccountKey
+                        ? previousErrorMessage
+                        : activeUsageRow?.errorMessage
                     logger.info("account removal completed key=\(accountKey, privacy: .private)")
                 } else {
-                    refreshRequested = true
+                    logger.info("discarded stale account removal result key=\(accountKey, privacy: .private)")
                 }
             } catch {
                 if configuration == currentFetchConfiguration {
                     errorMessage = error.localizedDescription
                     logger.error("account removal failed error_type=\(LogErrorSummary.category(error), privacy: .public) error=\(error.localizedDescription, privacy: .private)")
                 } else {
-                    refreshRequested = true
+                    logger.info("discarded stale account removal error key=\(accountKey, privacy: .private)")
                 }
             }
 
             isRemovingAccount = false
-            if refreshRequested {
-                refresh(trigger: .settingsChange)
-            }
+            runPendingRefreshIfPossible()
         }
     }
 
@@ -462,8 +697,69 @@ final class CodexUsageStore: ObservableObject {
     private var currentFetchConfiguration: FetchConfiguration {
         FetchConfiguration(
             usageDataSource: usageDataSource,
-            codexExecutablePath: codexExecutablePath
+            codexExecutablePath: codexExecutablePath,
+            generation: fetchGeneration
         )
+    }
+
+    private func persistAndApply(
+        _ nextPreferences: CodexUsagePreferences,
+        refreshReason: RefreshTrigger
+    ) throws {
+        let validated = try nextPreferences.validated()
+        try preferencesRepository.save(validated)
+
+        let fetchConfigurationChanged = usageDataSource != validated.usageDataSource
+            || codexExecutablePath != validated.codexExecutablePath
+        let intervalChanged = refreshInterval != validated.refreshInterval
+
+        usageDataSource = validated.usageDataSource
+        refreshInterval = validated.refreshInterval
+        codexExecutablePath = validated.codexExecutablePath
+
+        if fetchConfigurationChanged {
+            fetchGeneration &+= 1
+            pendingRefresh = nil
+            accountRows = []
+            activeAccountKey = nil
+            currentAccountRefreshState = nil
+            errorMessage = nil
+        }
+        if intervalChanged {
+            startAutoRefresh()
+        }
+        refresh(trigger: refreshReason)
+    }
+
+    private func enqueueRefresh(
+        _ kind: CodexPendingRefreshKind,
+        trigger: RefreshTrigger
+    ) {
+        guard !isConfigurationTransferSuspended else {
+            logger.info("refresh queue ignored during configuration transfer kind=\(String(describing: kind), privacy: .public) trigger=\(trigger.rawValue, privacy: .public)")
+            return
+        }
+        if let pendingRefresh {
+            self.pendingRefresh = PendingRefresh(
+                kind: pendingRefresh.kind.merged(with: kind),
+                trigger: kind == .all ? trigger : pendingRefresh.trigger
+            )
+        } else {
+            pendingRefresh = PendingRefresh(kind: kind, trigger: trigger)
+        }
+        logger.info("refresh intent queued kind=\(self.pendingRefresh?.kind == .all ? "all" : "current", privacy: .public) trigger=\(trigger.rawValue, privacy: .public)")
+    }
+
+    private func runPendingRefreshIfPossible() {
+        guard !isRefreshing, !isAccountManagementBusy, let pendingRefresh else { return }
+        self.pendingRefresh = nil
+        logger.info("running queued refresh kind=\(pendingRefresh.kind == .all ? "all" : "current", privacy: .public) trigger=\(pendingRefresh.trigger.rawValue, privacy: .public)")
+        switch pendingRefresh.kind {
+        case .current:
+            refreshCurrentAccount(trigger: pendingRefresh.trigger)
+        case .all:
+            refresh(trigger: pendingRefresh.trigger)
+        }
     }
 
     private func blockRefreshIfAccountManagementIsBusy(trigger: RefreshTrigger) -> Bool {
@@ -490,7 +786,9 @@ final class CodexUsageStore: ObservableObject {
         return nil
     }
 
-    nonisolated private static func loadUsage(configuration: FetchConfiguration) async throws -> UsageLoadResult {
+    nonisolated private static func loadUsage(
+        configuration: FetchConfiguration
+    ) async throws -> CodexUsageLoadResult {
         switch configuration.usageDataSource {
         case .oauthAPI:
             return try await Self.loadManagedAccountsUsage()
@@ -511,14 +809,15 @@ final class CodexUsageStore: ObservableObject {
                 storedUsage: snapshot,
                 isActive: true
             )
-            return UsageLoadResult(
+            return CodexUsageLoadResult(
                 rows: [AccountUsageRow(
                     account: account,
                     snapshot: snapshot,
                     errorMessage: nil,
                     isRefreshing: false
                 )],
-                activeAccountKey: account.accountKey
+                activeAccountKey: account.accountKey,
+                didRefreshCurrentAccount: true
             )
         }
     }
@@ -526,7 +825,7 @@ final class CodexUsageStore: ObservableObject {
     nonisolated private static func loadSingleUsage(
         accountKey: String,
         configuration: FetchConfiguration
-    ) async throws -> SingleAccountUsageLoadResult {
+    ) async throws -> CodexSingleAccountUsageLoadResult {
         switch configuration.usageDataSource {
         case .oauthAPI:
             return try await Self.loadManagedAccountsUsage(accountKey: accountKey)
@@ -547,19 +846,20 @@ final class CodexUsageStore: ObservableObject {
                 storedUsage: snapshot,
                 isActive: true
             )
-            return SingleAccountUsageLoadResult(
+            return CodexSingleAccountUsageLoadResult(
                 row: AccountUsageRow(
                     account: account,
                     snapshot: snapshot,
                     errorMessage: nil,
                     isRefreshing: false
                 ),
-                activeAccountKey: account.accountKey
+                activeAccountKey: account.accountKey,
+                didRefreshCurrentAccount: true
             )
         }
     }
 
-    nonisolated private static func loadManagedAccountsUsage() async throws -> UsageLoadResult {
+    nonisolated private static func loadManagedAccountsUsage() async throws -> CodexUsageLoadResult {
         let accountStore = CodexUsageAccountStore()
         var activeAccountKey = try accountStore.managedAccountKeyForActiveAuth()
         let registry = try accountStore.loadSnapshot(markingActiveAccountKey: activeAccountKey)
@@ -591,12 +891,12 @@ final class CodexUsageStore: ObservableObject {
 
         activeAccountKey = try accountStore.managedAccountKeyForActiveAuth()
         rows = Self.markRows(rows, activeAccountKey: activeAccountKey)
-        return UsageLoadResult(rows: rows, activeAccountKey: activeAccountKey)
+        return CodexUsageLoadResult(rows: rows, activeAccountKey: activeAccountKey)
     }
 
     nonisolated private static func loadManagedAccountsUsage(
         accountKey: String
-    ) async throws -> SingleAccountUsageLoadResult {
+    ) async throws -> CodexSingleAccountUsageLoadResult {
         let accountStore = CodexUsageAccountStore()
         let activeAccountKey = try accountStore.managedAccountKeyForActiveAuth()
         let registry = try accountStore.loadSnapshot(markingActiveAccountKey: activeAccountKey)
@@ -613,10 +913,17 @@ final class CodexUsageStore: ObservableObject {
                 ? .activeAuthReadOnly
                 : .managedSnapshot
         )
-        return SingleAccountUsageLoadResult(row: row, activeAccountKey: activeAccountKey)
+        let finalActiveAccountKey = try accountStore.managedAccountKeyForActiveAuth()
+        return CodexSingleAccountUsageLoadResult(
+            row: row,
+            activeAccountKey: finalActiveAccountKey,
+            didRefreshCurrentAccount: accountKey == finalActiveAccountKey
+                && activeAccountKey == finalActiveAccountKey
+                && row.errorMessage == nil
+        )
     }
 
-    nonisolated private static func loadCurrentManagedAccountUsage() async throws -> UsageLoadResult {
+    nonisolated private static func loadCurrentManagedAccountUsage() async throws -> CodexUsageLoadResult {
         let accountStore = CodexUsageAccountStore()
         let activeAccountKey = try accountStore.managedAccountKeyForActiveAuth()
         let registry = try accountStore.loadSnapshot(markingActiveAccountKey: activeAccountKey)
@@ -644,12 +951,23 @@ final class CodexUsageStore: ObservableObject {
             usageClient: usageClient,
             credentialSource: .activeAuthReadOnly
         )
+        let finalActiveAccountKey = try accountStore.managedAccountKeyForActiveAuth()
+        guard finalActiveAccountKey == activeAccountKey else {
+            let latestRegistry = try accountStore.loadSnapshot(
+                markingActiveAccountKey: finalActiveAccountKey
+            )
+            var changedResult = Self.storedRows(from: latestRegistry)
+            changedResult.errorMessage = "Current Codex account changed while quota was refreshing. Refresh again for the new account."
+            return changedResult
+        }
         if let index = result.rows.firstIndex(where: { $0.id == refreshedRow.id }) {
             result.rows[index] = refreshedRow
         } else {
             result.rows.append(refreshedRow)
         }
         result.activeAccountKey = activeAccountKey
+        result.errorMessage = refreshedRow.errorMessage
+        result.didRefreshCurrentAccount = refreshedRow.errorMessage == nil
         result.rows = result.rows.map { row in
             var next = row
             next.account.isActive = next.id == activeAccountKey
@@ -686,10 +1004,9 @@ final class CodexUsageStore: ObservableObject {
                     Self.backgroundLogger.info("managed account row refresh skipped because account became current key_fp=\(LogFingerprint.account(account.accountKey), privacy: .public) key=\(account.accountKey, privacy: .private)")
                     return Self.storedRow(for: currentAccount)
                 }
-                let authFileURL = try accountStore.authFileURL(for: account.accountKey)
                 snapshot = try await usageClient.loadSnapshot(
-                    authFileURL: authFileURL,
-                    managedAccount: account
+                    managedAccount: account,
+                    accountStore: accountStore
                 )
             case .activeAuthReadOnly:
                 snapshot = try await usageClient.loadSnapshotReadOnly(
@@ -717,7 +1034,9 @@ final class CodexUsageStore: ObservableObject {
         }
     }
 
-    nonisolated private static func addManagedAccount(codexExecutablePath: String) async throws -> UsageLoadResult {
+    nonisolated private static func addManagedAccount(
+        codexExecutablePath: String
+    ) async throws -> CodexUsageLoadResult {
         let authData: Data = try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 do {
@@ -732,7 +1051,9 @@ final class CodexUsageStore: ObservableObject {
         return try await Self.loadCurrentManagedAccountUsage()
     }
 
-    nonisolated private static func removeManagedAccount(accountKey: String) async throws -> UsageLoadResult {
+    nonisolated private static func removeManagedAccount(
+        accountKey: String
+    ) async throws -> CodexUsageLoadResult {
         try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 do {
@@ -745,9 +1066,11 @@ final class CodexUsageStore: ObservableObject {
         }
     }
 
-    nonisolated private static func storedRows(from snapshot: CodexManagedAccountsSnapshot) -> UsageLoadResult {
+    nonisolated private static func storedRows(
+        from snapshot: CodexManagedAccountsSnapshot
+    ) -> CodexUsageLoadResult {
         let rows = snapshot.accounts.map(Self.storedRow(for:))
-        return UsageLoadResult(rows: rows, activeAccountKey: snapshot.activeAccountKey)
+        return CodexUsageLoadResult(rows: rows, activeAccountKey: snapshot.activeAccountKey)
     }
 
     nonisolated private static func storedRow(for account: CodexManagedAccount) -> AccountUsageRow {
@@ -847,8 +1170,29 @@ final class CodexUsageStore: ObservableObject {
         }
     }
 
+    private func performStartupMaintenance() {
+        Task {
+            do {
+                try await Task.detached(priority: .utility) {
+                    try CodexUsageAccountStore().performStartupMaintenance()
+                }.value
+                logger.info("managed account startup maintenance completed")
+            } catch {
+                if errorMessage == nil {
+                    errorMessage = error.localizedDescription
+                }
+                logger.error("managed account startup maintenance failed error_type=\(LogErrorSummary.category(error), privacy: .public) error=\(error.localizedDescription, privacy: .private)")
+            }
+        }
+    }
+
     private func startAutoRefresh() {
         autoRefreshTask?.cancel()
+        guard !isConfigurationTransferSuspended else {
+            autoRefreshTask = nil
+            logger.info("auto refresh timer paused for configuration transfer")
+            return
+        }
         autoRefreshTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 guard let interval = self?.refreshInterval.randomizedNanoseconds else { return }
@@ -861,11 +1205,5 @@ final class CodexUsageStore: ObservableObject {
                 self?.refreshCurrentAccount(trigger: .timer)
             }
         }
-    }
-}
-
-private extension String {
-    var expandingTildeInPath: String {
-        (self as NSString).expandingTildeInPath
     }
 }
