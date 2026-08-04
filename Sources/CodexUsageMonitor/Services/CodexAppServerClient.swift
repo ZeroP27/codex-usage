@@ -332,10 +332,11 @@ struct CodexAppServerClient {
         }
     }
 
-    private static func makeSnapshot(
+    static func makeSnapshot(
         account: AccountPayload?,
         rateLimits: RateLimitsReadResult,
-        sourceDescription: String) throws -> UsageSnapshot
+        sourceDescription: String,
+        now: Date = Date()) throws -> UsageSnapshot
     {
         let selectedBucket = rateLimits.rateLimitsByLimitId?["codex"]
             ?? rateLimits.rateLimits
@@ -363,11 +364,15 @@ struct CodexAppServerClient {
             CodexAccount(type: $0.type, email: $0.email, planType: $0.planType)
         }
 
+        let resetCredits = rateLimits.rateLimitResetCredits?.summary(now: now)
+        Self.logger.info("app-server reset credits decoded present=\((resetCredits != nil), privacy: .public) available_count=\(resetCredits?.availableCount ?? 0, privacy: .public) reported_count=\(resetCredits?.reportedAvailableCount ?? 0, privacy: .public) expiration_count=\(resetCredits?.expirations.count ?? 0, privacy: .public)")
+
         return UsageSnapshot(
             account: accountSnapshot,
             sessionWindow: session,
             weeklyWindow: weekly,
-            updatedAt: Date(),
+            resetCredits: resetCredits,
+            updatedAt: now,
             sourceDescription: sourceDescription
         )
     }
@@ -753,7 +758,7 @@ private struct AccountReadResult: Decodable {
     var account: AccountPayload?
 }
 
-private struct AccountPayload: Decodable {
+struct AccountPayload: Decodable {
     var type: String
     var email: String?
     var planType: String?
@@ -764,15 +769,121 @@ private struct AccountLoginStartResult: Decodable {
     var authUrl: String?
 }
 
-private struct RateLimitsReadResult: Decodable {
+struct RateLimitsReadResult: Decodable {
     var rateLimits: RateLimitSnapshot?
     var rateLimitsByLimitId: [String: RateLimitSnapshot]?
+    var rateLimitResetCredits: RateLimitResetCreditsPayload?
+
+    private enum CodingKeys: String, CodingKey {
+        case rateLimits
+        case rateLimitsByLimitId
+        case rateLimitResetCredits
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        rateLimits = try? container.decodeIfPresent(
+            RateLimitSnapshot.self,
+            forKey: .rateLimits
+        )
+        rateLimitsByLimitId = try? container.decodeIfPresent(
+            [String: RateLimitSnapshot].self,
+            forKey: .rateLimitsByLimitId
+        )
+        rateLimitResetCredits = try? container.decodeIfPresent(
+            RateLimitResetCreditsPayload.self,
+            forKey: .rateLimitResetCredits
+        )
+    }
 }
 
-private struct RateLimitSnapshot: Decodable {
+struct RateLimitSnapshot: Decodable {
     var limitId: String?
     var primary: RateLimitWindowPayload?
     var secondary: RateLimitWindowPayload?
+}
+
+struct RateLimitResetCreditsPayload: Decodable {
+    var availableCount: Int
+    var credits: [Credit]
+
+    private enum CodingKeys: String, CodingKey {
+        case availableCount
+        case credits
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let rawCount: Int?
+        if let value = try? container.decode(Int.self, forKey: .availableCount) {
+            rawCount = value
+        } else if let value = try? container.decode(Double.self, forKey: .availableCount) {
+            rawCount = SafeNumericConversions.exactInt(value)
+        } else if let value = try? container.decode(String.self, forKey: .availableCount) {
+            rawCount = Int(value)
+        } else {
+            rawCount = nil
+        }
+
+        guard let rawCount else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .availableCount,
+                in: container,
+                debugDescription: "Reset credit count is missing or invalid."
+            )
+        }
+        availableCount = try ResetCreditsNormalizer.validateAvailableCount(
+            rawCount,
+            codingPath: container.codingPath + [CodingKeys.availableCount]
+        )
+        credits = (try? container.decodeIfPresent([Credit].self, forKey: .credits)) ?? []
+    }
+
+    func summary(now: Date) -> ResetCreditsSummary {
+        ResetCreditsNormalizer.summary(
+            availableCount: availableCount,
+            details: credits.map {
+                ResetCreditDetail(status: $0.status, expiresAt: $0.expiresAt)
+            },
+            now: now
+        )
+    }
+
+    struct Credit: Decodable {
+        var status: String?
+        var expiresAt: Date?
+
+        private enum CodingKeys: String, CodingKey {
+            case status
+            case expiresAt
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            status = try? container.decodeIfPresent(String.self, forKey: .status)
+            expiresAt = Self.decodeDate(for: .expiresAt, in: container)
+        }
+
+        private static func decodeDate(
+            for key: CodingKeys,
+            in container: KeyedDecodingContainer<CodingKeys>
+        ) -> Date? {
+            if let value = try? container.decode(Double.self, forKey: key),
+               let seconds = SafeNumericConversions.finiteDouble(value)
+            {
+                return Date(timeIntervalSince1970: seconds)
+            }
+            if let value = try? container.decode(Int.self, forKey: key) {
+                return Date(timeIntervalSince1970: TimeInterval(value))
+            }
+            if let value = try? container.decode(String.self, forKey: key),
+               let seconds = Double(value).flatMap(SafeNumericConversions.finiteDouble)
+            {
+                return Date(timeIntervalSince1970: seconds)
+            }
+            return nil
+        }
+    }
 }
 
 struct RateLimitWindowPayload: Decodable {

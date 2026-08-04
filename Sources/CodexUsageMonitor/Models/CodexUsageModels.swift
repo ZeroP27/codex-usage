@@ -4,6 +4,7 @@ struct UsageSnapshot: Equatable, Sendable {
     var account: CodexAccount?
     var sessionWindow: QuotaWindow?
     var weeklyWindow: QuotaWindow?
+    var resetCredits: ResetCreditsSummary? = nil
     var updatedAt: Date?
     var sourceDescription: String
 
@@ -201,6 +202,87 @@ struct QuotaWindow: Identifiable, Hashable, Sendable {
 
     var remainingFraction: Double {
         min(max(remainingPercent / 100, 0), 1)
+    }
+}
+
+struct ResetCreditsSummary: Equatable, Sendable {
+    var availableCount: Int
+    var reportedAvailableCount: Int
+    var expirations: [Date]
+
+    var nearestExpiration: Date? {
+        expirations.first
+    }
+
+    var hasCompleteDetails: Bool {
+        reportedAvailableCount >= availableCount
+    }
+}
+
+struct ResetCreditDetail: Equatable, Sendable {
+    var status: String?
+    var expiresAt: Date?
+}
+
+enum ResetCreditsNormalizer {
+    static let maximumAvailableCount = 10_000
+    static let maximumExpirationHorizon: TimeInterval =
+        10 * 366 * 24 * 60 * 60
+
+    static func summary(
+        availableCount: Int,
+        details: [ResetCreditDetail],
+        now: Date
+    ) -> ResetCreditsSummary {
+        let availableDetails = details
+            .filter { detail in
+                guard detail.status?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .lowercased() == "available"
+                else {
+                    return false
+                }
+                guard let expiresAt = detail.expiresAt else {
+                    return true
+                }
+                return expiresAt > now
+                    && expiresAt.timeIntervalSince(now)
+                        <= maximumExpirationHorizon
+            }
+            .sorted { lhs, rhs in
+                switch (lhs.expiresAt, rhs.expiresAt) {
+                case let (left?, right?):
+                    return left < right
+                case (_?, nil):
+                    return true
+                case (nil, _?):
+                    return false
+                case (nil, nil):
+                    return false
+                }
+            }
+
+        let authoritativeDetails = Array(availableDetails.prefix(availableCount))
+        return ResetCreditsSummary(
+            availableCount: availableCount,
+            reportedAvailableCount: authoritativeDetails.count,
+            expirations: authoritativeDetails.compactMap(\.expiresAt)
+        )
+    }
+
+    static func validateAvailableCount(
+        _ value: Int,
+        codingPath: [CodingKey]
+    ) throws -> Int {
+        guard (0...maximumAvailableCount).contains(value) else {
+            throw DecodingError.dataCorrupted(
+                DecodingError.Context(
+                    codingPath: codingPath,
+                    debugDescription: "Reset credit count is outside the supported range."
+                )
+            )
+        }
+        return value
     }
 }
 

@@ -185,7 +185,11 @@ struct CodexUsageAccountStore {
                 at: authURL,
                 maximumByteCount: Self.maximumAuthSnapshotByteCount
             )
-            let credentials = try validateAuthData(authData, for: account)
+            var credentials = try validateAuthData(authData, for: account)
+            if credentials.accountID == nil {
+                credentials.accountID = account.chatgptAccountID
+                Self.logger.info("resolved managed refresh account id from validated registry key_fp=\(LogFingerprint.account(accountKey), privacy: .public)")
+            }
             return CodexManagedCredentialsSnapshot(
                 accountKey: accountKey,
                 authData: authData,
@@ -566,6 +570,27 @@ struct CodexUsageAccountStore {
                     "The account registry contains duplicate accounts."
                 )
             }
+            if let resetCredits = account.lastUsage?.resetCredits {
+                let maximumExpiration = Date()
+                    .addingTimeInterval(
+                        ResetCreditsNormalizer.maximumExpirationHorizon
+                    )
+                    .timeIntervalSince1970
+                guard (0...ResetCreditsNormalizer.maximumAvailableCount)
+                    .contains(resetCredits.availableCount),
+                    (0...resetCredits.availableCount)
+                    .contains(resetCredits.reportedAvailableCount),
+                    resetCredits.expirations.count
+                        <= resetCredits.reportedAvailableCount,
+                    (resetCredits.expirations.allSatisfy {
+                        $0 >= 0 && TimeInterval($0) <= maximumExpiration
+                    })
+                else {
+                    throw CodexUsageAccountStoreError.archiveInvalid(
+                        "The account registry contains invalid reset credit data."
+                    )
+                }
+            }
             let filename = try Self.accountSnapshotFilename(
                 accountKey: accountKey
             )
@@ -908,7 +933,7 @@ struct CodexUsageAccountStore {
         registry.accounts[index].email = snapshot.account?.email ?? registry.accounts[index].email
 
         try saveRegistryFile(registry)
-        Self.logger.info("updated managed account usage key_fp=\(LogFingerprint.account(accountKey), privacy: .public) key=\(accountKey, privacy: .private) session_present=\((snapshot.sessionWindow != nil), privacy: .public) weekly_present=\((snapshot.weeklyWindow != nil), privacy: .public)")
+        Self.logger.info("updated managed account usage key_fp=\(LogFingerprint.account(accountKey), privacy: .public) key=\(accountKey, privacy: .private) session_present=\((snapshot.sessionWindow != nil), privacy: .public) weekly_present=\((snapshot.weeklyWindow != nil), privacy: .public) reset_credits_present=\((snapshot.resetCredits != nil), privacy: .public) reset_credits_count=\(snapshot.resetCredits?.availableCount ?? 0, privacy: .public)")
         return registry.accounts[index].managedAccount(activeAccountKey: registry.activeAccountKey)
     }
 
@@ -1430,23 +1455,34 @@ private struct ManagedRateLimitSnapshot: Codable {
     var primary: ManagedRateLimitWindow?
     var secondary: ManagedRateLimitWindow?
     var planType: String?
+    var resetCredits: ManagedResetCreditsSummary?
 
     enum CodingKeys: String, CodingKey {
         case primary
         case secondary
         case planType = "plan_type"
+        case resetCredits = "reset_credits"
     }
 
-    init(primary: ManagedRateLimitWindow?, secondary: ManagedRateLimitWindow?, planType: String?) {
+    init(
+        primary: ManagedRateLimitWindow?,
+        secondary: ManagedRateLimitWindow?,
+        planType: String?,
+        resetCredits: ManagedResetCreditsSummary? = nil
+    ) {
         self.primary = primary
         self.secondary = secondary
         self.planType = planType
+        self.resetCredits = resetCredits
     }
 
     init(snapshot: UsageSnapshot) {
         self.primary = snapshot.sessionWindow.map(ManagedRateLimitWindow.init(window:))
         self.secondary = snapshot.weeklyWindow.map(ManagedRateLimitWindow.init(window:))
         self.planType = snapshot.account?.planType
+        self.resetCredits = snapshot.resetCredits.map(
+            ManagedResetCreditsSummary.init(summary:)
+        )
     }
 
     func usageSnapshot(
@@ -1469,8 +1505,39 @@ private struct ManagedRateLimitSnapshot: Codable {
             ),
             sessionWindow: session,
             weeklyWindow: weekly,
+            resetCredits: resetCredits?.summary,
             updatedAt: updatedAt,
             sourceDescription: sourceDescription
+        )
+    }
+}
+
+private struct ManagedResetCreditsSummary: Codable {
+    var availableCount: Int
+    var reportedAvailableCount: Int
+    var expirations: [Int64]
+
+    enum CodingKeys: String, CodingKey {
+        case availableCount = "available_count"
+        case reportedAvailableCount = "reported_available_count"
+        case expirations
+    }
+
+    init(summary: ResetCreditsSummary) {
+        self.availableCount = summary.availableCount
+        self.reportedAvailableCount = summary.reportedAvailableCount
+        self.expirations = summary.expirations.compactMap {
+            SafeNumericConversions.truncatingInt64($0.timeIntervalSince1970)
+        }
+    }
+
+    var summary: ResetCreditsSummary {
+        ResetCreditsSummary(
+            availableCount: availableCount,
+            reportedAvailableCount: reportedAvailableCount,
+            expirations: expirations
+                .map { Date(timeIntervalSince1970: TimeInterval($0)) }
+                .sorted()
         )
     }
 }

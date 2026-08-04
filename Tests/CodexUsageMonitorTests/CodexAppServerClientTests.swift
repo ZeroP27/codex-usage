@@ -43,6 +43,92 @@ struct CodexAppServerClientTests {
     }
 
     @Test
+    func testRateLimitsReadMapsResetCreditsIntoUsageSnapshot() throws {
+        let data = try #require(
+            """
+            {
+              "rateLimits": {
+                "limitId": "codex",
+                "primary": {
+                  "usedPercent": 20,
+                  "windowDurationMins": 300,
+                  "resetsAt": 1700001000
+                },
+                "secondary": {
+                  "usedPercent": 40,
+                  "windowDurationMins": 10080,
+                  "resetsAt": 1700002000
+                }
+              },
+              "rateLimitResetCredits": {
+                "availableCount": 2,
+                "credits": [
+                  {
+                    "status": "available",
+                    "expiresAt": 1700003000
+                  },
+                  {
+                    "status": "available",
+                    "expiresAt": null
+                  },
+                  {
+                    "status": "consumed",
+                    "expiresAt": 1700004000
+                  }
+                ]
+              }
+            }
+            """.data(using: .utf8)
+        )
+
+        let result = try JSONDecoder().decode(RateLimitsReadResult.self, from: data)
+        let snapshot = try CodexAppServerClient.makeSnapshot(
+            account: nil,
+            rateLimits: result,
+            sourceDescription: "Test",
+            now: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+
+        #expect(snapshot.resetCredits?.availableCount == 2)
+        #expect(snapshot.resetCredits?.reportedAvailableCount == 2)
+        #expect(snapshot.resetCredits?.expirations == [
+            Date(timeIntervalSince1970: 1_700_003_000)
+        ])
+        #expect(snapshot.resetCredits?.hasCompleteDetails == true)
+    }
+
+    @Test
+    func testMalformedAppServerResetCreditsDoNotDiscardQuotaData() throws {
+        let data = try #require(
+            """
+            {
+              "rateLimits": {
+                "limitId": "codex",
+                "primary": {
+                  "usedPercent": 20,
+                  "windowDurationMins": 300
+                }
+              },
+              "rateLimitResetCredits": {
+                "availableCount": -1,
+                "credits": []
+              }
+            }
+            """.data(using: .utf8)
+        )
+
+        let result = try JSONDecoder().decode(RateLimitsReadResult.self, from: data)
+        let snapshot = try CodexAppServerClient.makeSnapshot(
+            account: nil,
+            rateLimits: result,
+            sourceDescription: "Test"
+        )
+
+        #expect(snapshot.sessionWindow?.remainingPercent == 80)
+        #expect(snapshot.resetCredits == nil)
+    }
+
+    @Test
     func testRPCRequestFailsQuicklyWhenOutputReachesEOF() throws {
         let inputPipe = Pipe()
         let outputPipe = Pipe()

@@ -7,6 +7,8 @@ The menu bar view shows:
 
 - 5-hour quota remaining and reset time
 - Weekly quota remaining and reset time
+- Available reset-credit count, nearest expiration, and a scrollable list of every
+  reported expiration
 - Managed ChatGPT accounts with current account and plan
 - Current-account refresh, all-account refresh, manual account switching, and configurable auto-refresh
 - Optional launch at login
@@ -109,11 +111,22 @@ Configured auto-refresh intervals are jittered around the selected interval
 instead of firing at an exact fixed cadence. Automatic and stale menu refreshes
 read quota for the current active account without modifying `~/.codex/auth.json`.
 The Accounts panel can manually refresh individual accounts or all managed
-accounts. All-account refresh skips the current active account.
+accounts. All-account refresh skips the current active account. Each account row
+keeps its own 5-hour and weekly reset times, plus the latest reset-credit
+summary, so the five-account view does not depend on whichever account is
+currently active.
+
+For Managed Accounts, quota refresh sends account-scoped, read-only `GET`
+requests to the ChatGPT usage endpoint and to
+`/backend-api/wham/rate-limit-reset-credits`. Codex Usage never calls a
+reset-credit consumption endpoint. Failure of the optional reset-credit request
+does not discard quota data returned by the usage request.
 
 CLI RPC is available from Settings. That mode starts a local
 `codex app-server --listen stdio://` process and reads rate-limit data through
-JSON-RPC.
+the read-only `account/rateLimits/read` JSON-RPC method. When that response
+contains reset-credit metadata, Codex Usage normalizes it into the same display
+model used by Managed Accounts.
 
 ## Privacy
 
@@ -126,6 +139,12 @@ adding a managed account. Quota refreshes do not write `~/.codex/auth.json`.
 
 The app does not use Keychain for managed accounts and does not depend on
 codex-auth.
+
+Persisted reset-credit metadata is deliberately limited to the authoritative
+available count, the number of reported available entries, and validated
+expiration timestamps. Opaque credit identifiers, titles, descriptions, and
+other server fields are neither decoded nor stored. Response size, count, and
+expiration ranges are bounded before data is accepted.
 
 The app stores local preferences in macOS UserDefaults: data source, refresh
 interval, and optional Codex executable path. It does not include analytics,

@@ -49,6 +49,77 @@ struct CodexUsageAccountStoreTests {
     }
 
     @Test
+    func testManagedRefreshUsesValidatedRegistryAccountIDWhenTokenFieldIsMissing() throws {
+        let fixture = try makeStoreFixture()
+        defer { fixture.cleanup() }
+        let first = try fixture.store.addAccount(authData: makeAuthData(
+            email: "first@example.com",
+            userID: "first-user",
+            accountID: "first-account",
+            planType: "plus",
+            includesTokenAccountID: false
+        ))
+        _ = try fixture.store.addAccount(authData: makeAuthData(
+            email: "second@example.com",
+            userID: "second-user",
+            accountID: "second-account",
+            planType: "pro"
+        ))
+
+        let credentials = try fixture.store.loadManagedCredentialsForRefresh(
+            accountKey: first.accountKey
+        ).credentials
+
+        #expect(credentials.accountID == first.chatgptAccountID)
+    }
+
+    @Test
+    func testUpdateUsagePersistsOnlySanitizedResetCreditSummary() throws {
+        let fixture = try makeStoreFixture()
+        defer { fixture.cleanup() }
+        let account = try fixture.store.addAccount(authData: makeAuthData(
+            email: "credits@example.com",
+            userID: "credits-user",
+            accountID: "credits-account",
+            planType: "plus"
+        ))
+        let expiration = Date(timeIntervalSince1970: 1_800_000_000)
+        let snapshot = UsageSnapshot(
+            account: account.codexAccount,
+            sessionWindow: nil,
+            weeklyWindow: nil,
+            resetCredits: ResetCreditsSummary(
+                availableCount: 2,
+                reportedAvailableCount: 1,
+                expirations: [expiration]
+            ),
+            updatedAt: Date(),
+            sourceDescription: "Test"
+        )
+
+        _ = try fixture.store.updateUsage(
+            accountKey: account.accountKey,
+            snapshot: snapshot
+        )
+        let reloaded = try #require(
+            fixture.store.loadSnapshot().accounts.first?.storedUsage?.resetCredits
+        )
+
+        #expect(reloaded.availableCount == 2)
+        #expect(reloaded.reportedAvailableCount == 1)
+        #expect(reloaded.expirations == [expiration])
+
+        let registryText = try #require(
+            String(
+                data: Data(contentsOf: fixture.store.registryFileURL),
+                encoding: .utf8
+            )
+        )
+        #expect(registryText.contains(#""reset_credits""#))
+        #expect(!registryText.contains(#""credit_id""#))
+    }
+
+    @Test
     func testAddingDuplicateAccountUpdatesSnapshotWithoutDuplicatingRegistry() throws {
         let fixture = try makeStoreFixture()
         defer { fixture.cleanup() }
@@ -1098,7 +1169,8 @@ struct CodexUsageAccountStoreTests {
         planType: String,
         accessToken: String? = nil,
         refreshToken: String? = nil,
-        lastRefresh: String? = nil
+        lastRefresh: String? = nil,
+        includesTokenAccountID: Bool = true
     ) throws -> Data {
         let idToken = try makeJWT(payload: [
             "email": email,
@@ -1108,13 +1180,16 @@ struct CodexUsageAccountStoreTests {
                 "chatgpt_plan_type": planType
             ]
         ])
+        var tokens: [String: Any] = [
+            "access_token": accessToken ?? "access-\(userID)",
+            "refresh_token": refreshToken ?? "refresh-\(userID)",
+            "id_token": idToken
+        ]
+        if includesTokenAccountID {
+            tokens["account_id"] = accountID
+        }
         var json: [String: Any] = [
-            "tokens": [
-                "access_token": accessToken ?? "access-\(userID)",
-                "refresh_token": refreshToken ?? "refresh-\(userID)",
-                "id_token": idToken,
-                "account_id": accountID
-            ]
+            "tokens": tokens
         ]
         if let lastRefresh {
             json["last_refresh"] = lastRefresh

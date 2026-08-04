@@ -30,7 +30,7 @@ struct MenuBarUsageView: View {
             }
         }
         .padding(14)
-        .frame(width: MenuLayout.panelWidth)
+        .frame(width: panelWidth)
         .onAppear {
             store.refreshIfStale()
         }
@@ -38,6 +38,15 @@ struct MenuBarUsageView: View {
             if count <= 1 {
                 activePanel = .summary
             }
+        }
+    }
+
+    private var panelWidth: CGFloat {
+        switch activePanel {
+        case .summary:
+            return MenuLayout.summaryPanelWidth
+        case .accounts:
+            return MenuLayout.accountsPanelWidth
         }
     }
 
@@ -57,6 +66,9 @@ struct MenuBarUsageView: View {
 
                     CompactInfoRow(title: "Account", value: row.account.displayName)
                     CompactInfoRow(title: "Plan", value: row.planLabel)
+                    ResetCreditsSummaryInfoRow(
+                        summary: row.snapshot.resetCredits
+                    )
                     CompactInfoRow(
                         title: "Updated",
                         value: UsageFormatters.updatedAt(row.snapshot.updatedAt)
@@ -130,14 +142,14 @@ private enum MenuPanel {
 }
 
 private enum MenuLayout {
-    static let panelWidth: CGFloat = 352
-    static let accountRowMinHeight: CGFloat = 70
-    static let accountRowSpacing: CGFloat = 6
+    static let summaryPanelWidth: CGFloat = 352
+    static let accountsPanelWidth: CGFloat = 400
+    static let accountRowMinHeight: CGFloat = 88
     static let visibleAccountRows = 5
 
     static var accountsListMaxHeight: CGFloat {
         accountRowMinHeight * CGFloat(visibleAccountRows)
-            + accountRowSpacing * CGFloat(visibleAccountRows - 1)
+            + CGFloat(visibleAccountRows - 1)
     }
 }
 
@@ -258,8 +270,8 @@ private struct AccountsPanel: View {
     }
 
     private var accountRows: some View {
-        VStack(spacing: MenuLayout.accountRowSpacing) {
-            ForEach(rows) { row in
+        VStack(spacing: 0) {
+            ForEach(Array(rows.enumerated()), id: \.element.id) { index, row in
                 AccountMenuRow(
                     row: row,
                     isRefreshing: isRefreshing,
@@ -268,6 +280,11 @@ private struct AccountsPanel: View {
                     activate: activate,
                     refreshAccount: refreshAccount
                 )
+
+                if index < rows.count - 1 {
+                    Divider()
+                        .padding(.leading, 38)
+                }
             }
         }
     }
@@ -316,86 +333,113 @@ private struct AccountMenuRow: View {
     var refreshAccount: (String) -> Void
 
     var body: some View {
-        HStack(alignment: .center, spacing: 8) {
-            Button {
-                Self.logger.info("account switch clicked key_fp=\(LogFingerprint.account(row.id), privacy: .public) key=\(row.id, privacy: .private) is_active=\(row.isActive, privacy: .public)")
-                activate(row.id)
-            } label: {
-                Image(systemName: switchSymbol)
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(switchColor)
-                    .frame(width: 22, height: 22)
-            }
-            .buttonStyle(.borderless)
-            .disabled(row.isActive || isActivatingAccount || isRefreshing)
-            .help(row.isActive ? "Active account" : "Switch Codex to this account")
-
-            VStack(alignment: .leading, spacing: 7) {
-                HStack(spacing: 6) {
-                    Text(row.account.displayName)
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.primary)
-                        .lineLimit(1)
-
-                    Text(row.planLabel)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Button {
+                    Self.logger.info("account switch clicked key_fp=\(LogFingerprint.account(row.id), privacy: .public) key=\(row.id, privacy: .private) is_active=\(row.isActive, privacy: .public)")
+                    activate(row.id)
+                } label: {
+                    Image(systemName: switchSymbol)
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(switchColor)
+                        .frame(width: 22, height: 22)
                 }
+                .buttonStyle(.borderless)
+                .disabled(row.isActive || isActivatingAccount || isRefreshing)
+                .help(row.isActive ? "Active account" : "Switch Codex to this account")
 
-                if let error = row.errorMessage, !error.isEmpty {
-                    Text(error)
-                        .font(.caption2)
-                        .foregroundStyle(.red)
-                        .lineLimit(2)
-                } else {
-                    VStack(spacing: 5) {
-                        AccountQuotaLine(title: "5H", window: row.snapshot.sessionWindow)
-                        AccountQuotaLine(title: "Weekly", window: row.snapshot.weeklyWindow)
+                Text(row.account.displayName)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                    .layoutPriority(1)
+
+                Text(row.planLabel)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+
+                Spacer(minLength: 4)
+
+                Button {
+                    Self.logger.info("account row refresh clicked key_fp=\(LogFingerprint.account(row.id), privacy: .public) key=\(row.id, privacy: .private)")
+                    refreshAccount(row.id)
+                } label: {
+                    if row.isRefreshing {
+                        ProgressView()
+                            .controlSize(.small)
+                            .frame(width: 24, height: 22)
+                    } else {
+                        Image(systemName: "arrow.clockwise")
+                            .font(.caption.weight(.semibold))
+                            .frame(width: 24, height: 22)
                     }
                 }
+                .buttonStyle(.borderless)
+                .disabled(
+                    row.isRefreshing
+                        || isRefreshing
+                        || isRefreshingAll
+                        || isActivatingAccount
+                )
+                .help("Refresh this account quota")
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
 
-            Button {
-                Self.logger.info("account row refresh clicked key_fp=\(LogFingerprint.account(row.id), privacy: .public) key=\(row.id, privacy: .private)")
-                refreshAccount(row.id)
-            } label: {
-                if row.isRefreshing {
-                    ProgressView()
-                        .controlSize(.small)
-                        .frame(width: 24, height: 24)
-                } else {
-                    Image(systemName: "arrow.clockwise")
-                        .font(.caption.weight(.semibold))
-                        .frame(width: 24, height: 24)
-                }
+            HStack(spacing: 10) {
+                AccountQuotaMetric(
+                    title: "5H",
+                    window: row.snapshot.sessionWindow
+                )
+
+                Divider()
+                    .frame(height: 14)
+
+                AccountQuotaMetric(
+                    title: "Weekly",
+                    window: row.snapshot.weeklyWindow
+                )
             }
-            .buttonStyle(.borderless)
-            .disabled(row.isRefreshing || isRefreshing || isRefreshingAll || isActivatingAccount)
-            .help("Refresh this account quota")
+            .padding(.leading, 28)
+
+            if let error = row.errorMessage, !error.isEmpty {
+                Label(error, systemImage: "exclamationmark.triangle")
+                    .font(.caption2)
+                    .foregroundStyle(.red)
+                    .lineLimit(1)
+                    .help(error)
+                    .padding(.leading, 28)
+            } else {
+                HStack(spacing: 6) {
+                    Label(
+                        "Wk resets \(UsageFormatters.weeklyResetTime(row.snapshot.weeklyWindow?.resetsAt))",
+                        systemImage: "calendar"
+                    )
+                    .lineLimit(1)
+                    .layoutPriority(1)
+
+                    Spacer(minLength: 6)
+
+                    ResetCreditsDisclosure(
+                        summary: row.snapshot.resetCredits,
+                        style: .account
+                    )
+                }
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .padding(.leading, 28)
+            }
         }
-        .padding(9)
+        .padding(.horizontal, 7)
+        .padding(.vertical, 6)
         .frame(minHeight: MenuLayout.accountRowMinHeight)
         .background(
-            Color(nsColor: .controlBackgroundColor),
-            in: RoundedRectangle(cornerRadius: 8, style: .continuous)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .strokeBorder(rowBorderColor, lineWidth: rowBorderWidth)
+            rowBackground,
+            in: RoundedRectangle(cornerRadius: 6, style: .continuous)
         )
     }
 
-    private var rowBorderColor: Color {
-        if row.isActive {
-            return Color.accentColor.opacity(0.55)
-        }
-        return Color(nsColor: .separatorColor).opacity(0.16)
-    }
-
-    private var rowBorderWidth: CGFloat {
-        row.isActive ? 1 : 0.5
+    private var rowBackground: Color {
+        row.isActive ? Color.accentColor.opacity(0.08) : .clear
     }
 
     private var switchSymbol: String {
@@ -407,16 +451,16 @@ private struct AccountMenuRow: View {
     }
 }
 
-private struct AccountQuotaLine: View {
+private struct AccountQuotaMetric: View {
     var title: String
     var window: QuotaWindow?
 
     var body: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 5) {
             Text(title)
                 .font(.caption2)
                 .foregroundStyle(.secondary)
-                .frame(width: 42, alignment: .leading)
+                .frame(width: 40, alignment: .leading)
 
             if let window {
                 MenuProgressBar(window: window)
@@ -429,13 +473,308 @@ private struct AccountQuotaLine: View {
             Text(valueText)
                 .font(.caption2.monospacedDigit())
                 .foregroundStyle(.secondary)
-                .frame(width: 38, alignment: .trailing)
+                .frame(width: 34, alignment: .trailing)
         }
+        .frame(maxWidth: .infinity)
     }
 
     private var valueText: String {
         guard let window else { return "--" }
         return UsageFormatters.percent(window.remainingPercent)
+    }
+}
+
+private enum ResetCreditsDisclosureStyle: String {
+    case summary
+    case account
+}
+
+private struct ResetCreditsDisclosure: View {
+    private static let logger = Logger(
+        subsystem: "dev.idea-space.CodexUsageMonitor",
+        category: "MenuBar"
+    )
+    var summary: ResetCreditsSummary?
+    var style: ResetCreditsDisclosureStyle
+    @State private var isShowingDetails = false
+    @State private var detailsReferenceDate = Date()
+
+    @ViewBuilder
+    var body: some View {
+        if let summary, summary.availableCount > 0 {
+            Button {
+                detailsReferenceDate = Date()
+                isShowingDetails = true
+                Self.logger.info("reset credit details opened placement=\(style.rawValue, privacy: .public) available_count=\(summary.availableCount, privacy: .public) reported_count=\(summary.reportedAvailableCount, privacy: .public)")
+            } label: {
+                disclosureLabel
+            }
+            .buttonStyle(.borderless)
+            .popover(isPresented: $isShowingDetails, arrowEdge: .trailing) {
+                ResetCreditsDetailsPopover(
+                    summary: summary,
+                    referenceDate: detailsReferenceDate
+                )
+            }
+            .help("Show all reported reset credit expiration details")
+            .accessibilityLabel(
+                ResetCreditsPresentation.accessibilityText(summary)
+            )
+            .accessibilityHint(
+                "Shows every reported expiration time."
+            )
+        } else {
+            disclosureLabel
+                .help(ResetCreditsPresentation.helpText(summary))
+                .accessibilityLabel(
+                    ResetCreditsPresentation.accessibilityText(summary)
+                )
+        }
+    }
+
+    @ViewBuilder
+    private var disclosureLabel: some View {
+        switch style {
+        case .summary:
+            HStack(spacing: 4) {
+                Text(ResetCreditsPresentation.summaryValue(summary))
+                    .lineLimit(1)
+
+                if summary?.availableCount ?? 0 > 0 {
+                    Image(systemName: "info.circle")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+            }
+        case .account:
+            HStack(spacing: 4) {
+                Image(systemName: "arrow.counterclockwise")
+                accountValueText
+                    .lineLimit(1)
+            }
+        }
+    }
+
+    private var accountValueText: Text {
+        guard let summary else {
+            return Text("Reset unavailable")
+                .foregroundColor(.secondary)
+        }
+        guard summary.availableCount > 0 else {
+            return Text("No resets")
+                .foregroundColor(.secondary)
+        }
+
+        let count = Text(
+            UsageFormatters.resetCreditCount(summary.availableCount)
+        )
+        .foregroundColor(.secondary)
+
+        guard let expiration = ResetCreditsPresentation.nearestFutureExpiration(
+            summary
+        ) else {
+            return count
+                + Text(" · expiry unavailable")
+                    .foregroundColor(.secondary)
+        }
+
+        let expirationColor: Color = UsageFormatters.isImminentExpiry(expiration)
+            ? .orange
+            : .secondary
+        return count
+            + Text(" · exp ")
+                .foregroundColor(.secondary)
+            + Text(UsageFormatters.compactExpiryTime(expiration))
+                .foregroundColor(expirationColor)
+    }
+}
+
+private struct ResetCreditsDetailsPopover: View {
+    var summary: ResetCreditsSummary
+    var referenceDate: Date
+
+    var body: some View {
+        let expirations = summary.expirations.sorted()
+
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Label(
+                        "Reset credits",
+                        systemImage: "arrow.counterclockwise"
+                    )
+                    .font(.headline)
+
+                    Text(detailCoverageText)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer()
+
+                Text("\(summary.availableCount)")
+                    .font(.title3.weight(.semibold).monospacedDigit())
+                    .accessibilityLabel(
+                        UsageFormatters.resetCreditCount(
+                            summary.availableCount
+                        )
+                    )
+            }
+
+            if expirations.contains(where: { $0 <= referenceDate }) {
+                Label(
+                    "This snapshot contains an expired detail. Refresh the account to update the available count.",
+                    systemImage: "exclamationmark.triangle"
+                )
+                .font(.caption)
+                .foregroundStyle(.orange)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Divider()
+
+            if expirations.isEmpty {
+                Label(
+                    "The service did not report an expiration time.",
+                    systemImage: "calendar.badge.exclamationmark"
+                )
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.vertical, 8)
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        ForEach(expirations.indices, id: \.self) { index in
+                            ResetCreditExpirationDetailRow(
+                                number: index + 1,
+                                expiration: expirations[index],
+                                referenceDate: referenceDate
+                            )
+
+                            if index < expirations.count - 1 {
+                                Divider()
+                                    .padding(.leading, 32)
+                            }
+                        }
+                    }
+                }
+                .frame(maxHeight: 260)
+            }
+
+            if missingExpirationCount > 0 || unreportedDetailCount > 0 {
+                Divider()
+
+                VStack(alignment: .leading, spacing: 4) {
+                    if missingExpirationCount > 0 {
+                        Text(
+                            "\(missingExpirationCount) reported \(missingExpirationCount == 1 ? "credit has" : "credits have") no expiration time."
+                        )
+                    }
+                    if unreportedDetailCount > 0 {
+                        Text(
+                            "The service did not provide details for \(unreportedDetailCount) \(unreportedDetailCount == 1 ? "credit" : "credits")."
+                        )
+                    }
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(14)
+        .frame(width: 340)
+    }
+
+    private var missingExpirationCount: Int {
+        max(summary.reportedAvailableCount - summary.expirations.count, 0)
+    }
+
+    private var unreportedDetailCount: Int {
+        max(summary.availableCount - summary.reportedAvailableCount, 0)
+    }
+
+    private var detailCoverageText: String {
+        if summary.reportedAvailableCount >= summary.availableCount {
+            return "All reported details"
+        }
+        return "\(summary.reportedAvailableCount) of \(summary.availableCount) details reported"
+    }
+}
+
+private struct ResetCreditExpirationDetailRow: View {
+    var number: Int
+    var expiration: Date
+    var referenceDate: Date
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text("\(number)")
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.tertiary)
+                .frame(width: 22, alignment: .trailing)
+
+            Image(systemName: statusSymbol)
+                .font(.caption)
+                .foregroundStyle(statusColor)
+                .frame(width: 12)
+
+            Text(UsageFormatters.dateTime.string(from: expiration))
+                .font(.caption.monospacedDigit())
+                .lineLimit(1)
+
+            Spacer(minLength: 8)
+
+            Text(statusText)
+                .font(.caption2)
+                .foregroundStyle(statusColor)
+        }
+        .padding(.vertical, 7)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(
+            "Reset \(number), expires \(UsageFormatters.dateTime.string(from: expiration)), \(statusText)"
+        )
+    }
+
+    private var hasExpired: Bool {
+        expiration <= referenceDate
+    }
+
+    private var expiresSoon: Bool {
+        UsageFormatters.isImminentExpiry(
+            expiration,
+            relativeTo: referenceDate
+        )
+    }
+
+    private var statusText: String {
+        if hasExpired {
+            return "Expired"
+        }
+        if expiresSoon {
+            return "Soon"
+        }
+        return "Available"
+    }
+
+    private var statusSymbol: String {
+        if hasExpired {
+            return "xmark.circle.fill"
+        }
+        if expiresSoon {
+            return "exclamationmark.circle.fill"
+        }
+        return "checkmark.circle.fill"
+    }
+
+    private var statusColor: Color {
+        if hasExpired {
+            return .red
+        }
+        if expiresSoon {
+            return .orange
+        }
+        return .secondary
     }
 }
 
@@ -481,9 +820,96 @@ private struct MenuQuotaCard: View {
     }
 }
 
+@MainActor
+private enum ResetCreditsPresentation {
+    static func nearestFutureExpiration(
+        _ summary: ResetCreditsSummary,
+        now: Date = Date()
+    ) -> Date? {
+        summary.expirations.filter { $0 > now }.min()
+    }
+
+    static func summaryValue(
+        _ summary: ResetCreditsSummary?,
+        now: Date = Date()
+    ) -> String {
+        guard let summary else { return "Unavailable" }
+        guard summary.availableCount > 0 else { return "None" }
+
+        let count = "\(summary.availableCount)"
+        guard let expiration = nearestFutureExpiration(summary, now: now) else {
+            return "\(count) · expiry unavailable"
+        }
+        return "\(count) · \(UsageFormatters.compactExpiryTime(expiration, relativeTo: now))"
+    }
+
+    static func helpText(
+        _ summary: ResetCreditsSummary?,
+        now: Date = Date()
+    ) -> String {
+        guard let summary else {
+            return "Reset credit information is unavailable."
+        }
+        guard summary.availableCount > 0 else {
+            return "No reset credits are available."
+        }
+
+        var lines = [
+            "\(UsageFormatters.resetCreditCount(summary.availableCount)) available."
+        ]
+        if summary.reportedAvailableCount < summary.availableCount {
+            lines.append(
+                "The service reported details for \(summary.reportedAvailableCount) of \(summary.availableCount) credits."
+            )
+        }
+
+        let expirations = summary.expirations.filter { $0 > now }.sorted()
+        if let nearest = expirations.first {
+            lines.append(
+                "Nearest reported expiration: \(UsageFormatters.dateTime.string(from: nearest))."
+            )
+        } else {
+            lines.append("No future expiration time was reported.")
+        }
+        return lines.joined(separator: " ")
+    }
+
+    static func accessibilityText(
+        _ summary: ResetCreditsSummary?,
+        now: Date = Date()
+    ) -> String {
+        let text = helpText(summary, now: now)
+        guard summary?.availableCount ?? 0 > 0 else {
+            return text
+        }
+        return "\(text) Activate to show every reported expiration."
+    }
+}
+
+private struct ResetCreditsSummaryInfoRow: View {
+    var summary: ResetCreditsSummary?
+
+    var body: some View {
+        HStack {
+            Text("Reset credits")
+                .foregroundStyle(.secondary)
+
+            Spacer()
+
+            ResetCreditsDisclosure(
+                summary: summary,
+                style: .summary
+            )
+        }
+        .font(.caption)
+        .padding(.horizontal, 2)
+    }
+}
+
 private struct CompactInfoRow: View {
     var title: String
     var value: String
+    var helpText: String? = nil
 
     var body: some View {
         HStack {
@@ -495,6 +921,7 @@ private struct CompactInfoRow: View {
         }
         .font(.caption)
         .padding(.horizontal, 2)
+        .help(helpText ?? "\(title): \(value)")
     }
 }
 

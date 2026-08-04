@@ -3,6 +3,9 @@ import OSLog
 
 struct CodexOAuthUsageClient {
     var timeout: TimeInterval = 30
+    var session: URLSession = .shared
+    private static let resetCreditsTimeout: TimeInterval = 4
+    private static let maximumResetCreditsResponseByteCount = 256 * 1_024
     private static let logger = Logger(
         subsystem: "dev.idea-space.CodexUsageMonitor",
         category: "OAuthUsage"
@@ -31,11 +34,14 @@ struct CodexOAuthUsageClient {
         }
 
         do {
-            let response = try await fetchUsage(credentials: credentials)
+            let (response, resetCredits) = try await fetchUsageAndResetCredits(
+                credentials: credentials
+            )
             return try Self.makeSnapshot(
                 response: response,
                 credentials: credentials,
-                managedAccount: managedAccount
+                managedAccount: managedAccount,
+                resetCredits: resetCredits
             )
         } catch CodexOAuthUsageError.unauthorized where !credentials.refreshToken.isEmpty {
             credentials = try await CodexOAuthTokenRefresher.refresh(credentials, timeout: timeout)
@@ -46,11 +52,14 @@ struct CodexOAuthUsageClient {
                 credentials: credentials
             )
             Self.logger.info("refreshed token after unauthorized key=\(managedAccount.accountKey, privacy: .private)")
-            let response = try await fetchUsage(credentials: credentials)
+            let (response, resetCredits) = try await fetchUsageAndResetCredits(
+                credentials: credentials
+            )
             return try Self.makeSnapshot(
                 response: response,
                 credentials: credentials,
-                managedAccount: managedAccount
+                managedAccount: managedAccount,
+                resetCredits: resetCredits
             )
         }
     }
@@ -66,11 +75,14 @@ struct CodexOAuthUsageClient {
         )
         try Self.validateCredentials(credentials, match: managedAccount)
         Self.logger.info("loading read-only oauth usage key=\(managedAccount?.accountKey ?? "active", privacy: .private)")
-        let response = try await fetchUsage(credentials: credentials)
+        let (response, resetCredits) = try await fetchUsageAndResetCredits(
+            credentials: credentials
+        )
         return try Self.makeSnapshot(
             response: response,
             credentials: credentials,
-            managedAccount: managedAccount
+            managedAccount: managedAccount,
+            resetCredits: resetCredits
         )
     }
 
@@ -91,6 +103,14 @@ struct CodexOAuthUsageClient {
         }
     }
 
+    private func fetchUsageAndResetCredits(
+        credentials: CodexOAuthCredentials
+    ) async throws -> (CodexOAuthUsageResponse, ResetCreditsSummary?) {
+        async let usageResponse = fetchUsage(credentials: credentials)
+        async let resetCredits = fetchResetCreditsIfAvailable(credentials: credentials)
+        return try await (usageResponse, resetCredits)
+    }
+
     private func fetchUsage(credentials: CodexOAuthCredentials) async throws -> CodexOAuthUsageResponse {
         var request = URLRequest(url: Self.usageURL())
         request.httpMethod = "GET"
@@ -105,7 +125,7 @@ struct CodexOAuthUsageClient {
         Self.logger.info("fetching oauth usage account_id_present=\((credentials.accountID?.isEmpty == false), privacy: .public) account_id_fp=\(LogFingerprint.account(credentials.accountID), privacy: .public) account_id=\(credentials.accountID ?? "missing", privacy: .private)")
 
         do {
-            let (data, response) = try await URLSession.shared.data(for: request)
+            let (data, response) = try await session.data(for: request)
             guard let httpResponse = response as? HTTPURLResponse else {
                 throw CodexOAuthUsageError.invalidResponse
             }
@@ -127,13 +147,157 @@ struct CodexOAuthUsageClient {
             }
         } catch let error as CodexOAuthUsageError {
             throw error
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
+            if Task.isCancelled || (error as? URLError)?.code == .cancelled {
+                throw CancellationError()
+            }
             throw CodexOAuthUsageError.networkError(error)
         }
     }
 
+    private func fetchResetCreditsIfAvailable(
+        credentials: CodexOAuthCredentials
+    ) async throws -> ResetCreditsSummary? {
+        do {
+            return try await fetchResetCredits(credentials: credentials)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            Self.logger.error("oauth reset credits unavailable error_type=\(LogErrorSummary.category(error), privacy: .public) error=\(error.localizedDescription, privacy: .private)")
+            return nil
+        }
+    }
+
+    private func fetchResetCredits(
+        credentials: CodexOAuthCredentials
+    ) async throws -> ResetCreditsSummary {
+        let request = try Self.resetCreditsRequest(
+            credentials: credentials,
+            timeout: min(timeout, Self.resetCreditsTimeout)
+        )
+        Self.logger.info("fetching oauth reset credits account_id_fp=\(LogFingerprint.account(credentials.accountID), privacy: .public)")
+
+        do {
+            let (data, response) = try await Self.boundedData(
+                for: request,
+                using: session,
+                maximumByteCount: Self.maximumResetCreditsResponseByteCount
+            )
+            guard let httpResponse = response as? HTTPURLResponse else {
+                throw CodexOAuthUsageError.invalidResponse
+            }
+
+            switch httpResponse.statusCode {
+            case 200...299:
+                do {
+                    let response = try JSONDecoder().decode(
+                        CodexOAuthResetCreditsResponse.self,
+                        from: data
+                    )
+                    let summary = response.summary(now: Date())
+                    Self.logger.info("oauth reset credits fetched available_count=\(summary.availableCount, privacy: .public) reported_count=\(summary.reportedAvailableCount, privacy: .public) expiration_count=\(summary.expirations.count, privacy: .public)")
+                    return summary
+                } catch let error as CodexOAuthUsageError {
+                    throw error
+                } catch {
+                    throw CodexOAuthUsageError.decodeFailed(error.localizedDescription)
+                }
+            case 401, 403:
+                throw CodexOAuthUsageError.unauthorized
+            default:
+                throw CodexOAuthUsageError.serverError(
+                    httpResponse.statusCode,
+                    Self.errorBody(from: data)
+                )
+            }
+        } catch let error as CodexOAuthUsageError {
+            throw error
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            if Task.isCancelled || (error as? URLError)?.code == .cancelled {
+                throw CancellationError()
+            }
+            throw CodexOAuthUsageError.networkError(error)
+        }
+    }
+
+    static func boundedData(
+        for request: URLRequest,
+        using session: URLSession,
+        maximumByteCount: Int
+    ) async throws -> (Data, URLResponse) {
+        precondition(maximumByteCount >= 0)
+        let (bytes, response) = try await session.bytes(for: request)
+        let expectedByteCount = response.expectedContentLength
+        if expectedByteCount > Int64(maximumByteCount) {
+            bytes.task.cancel()
+            throw CodexOAuthUsageError.decodeFailed(
+                "Response exceeded the supported \(maximumByteCount)-byte limit."
+            )
+        }
+
+        var data = Data()
+        if expectedByteCount > 0 {
+            data.reserveCapacity(Int(expectedByteCount))
+        }
+
+        do {
+            for try await byte in bytes {
+                guard data.count < maximumByteCount else {
+                    bytes.task.cancel()
+                    throw CodexOAuthUsageError.decodeFailed(
+                        "Response exceeded the supported \(maximumByteCount)-byte limit."
+                    )
+                }
+                data.append(byte)
+            }
+        } catch {
+            bytes.task.cancel()
+            throw error
+        }
+        return (data, response)
+    }
+
+    static func resetCreditsRequest(
+        credentials: CodexOAuthCredentials,
+        timeout: TimeInterval
+    ) throws -> URLRequest {
+        guard let accountID = credentials.accountID?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+            !accountID.isEmpty
+        else {
+            throw CodexOAuthUsageError.missingAccountInfo(
+                "ChatGPT account id is missing."
+            )
+        }
+
+        var request = URLRequest(
+            url: Self.resetCreditsURL(),
+            cachePolicy: .reloadIgnoringLocalCacheData,
+            timeoutInterval: timeout
+        )
+        request.httpMethod = "GET"
+        request.setValue(
+            "Bearer \(credentials.accessToken)",
+            forHTTPHeaderField: "Authorization"
+        )
+        request.setValue(accountID, forHTTPHeaderField: "ChatGPT-Account-ID")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("Codex Usage", forHTTPHeaderField: "User-Agent")
+        request.setValue("codex-1", forHTTPHeaderField: "OpenAI-Beta")
+        request.setValue("Codex Desktop", forHTTPHeaderField: "originator")
+        return request
+    }
+
     private static func usageURL() -> URL {
         URL(string: "https://chatgpt.com/backend-api/wham/usage")!
+    }
+
+    private static func resetCreditsURL() -> URL {
+        URL(string: "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits")!
     }
 
     private static func errorBody(from data: Data) -> String? {
@@ -153,7 +317,8 @@ struct CodexOAuthUsageClient {
     static func makeSnapshot(
         response: CodexOAuthUsageResponse,
         credentials: CodexOAuthCredentials,
-        managedAccount: CodexManagedAccount?) throws -> UsageSnapshot
+        managedAccount: CodexManagedAccount?,
+        resetCredits: ResetCreditsSummary? = nil) throws -> UsageSnapshot
     {
         let windows = [
             ("primary", response.rateLimit?.primaryWindow),
@@ -201,6 +366,7 @@ struct CodexOAuthUsageClient {
             ),
             sessionWindow: session,
             weeklyWindow: weekly,
+            resetCredits: resetCredits,
             updatedAt: Date(),
             sourceDescription: CodexUsageDataSource.oauthAPI.title
         )
@@ -646,6 +812,82 @@ enum CodexOAuthTokenResponseParser {
         guard let value = value as? String else { return nil }
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
+    }
+}
+
+struct CodexOAuthResetCreditsResponse: Decodable {
+    var availableCount: Int
+    var credits: [Credit]
+
+    private enum CodingKeys: String, CodingKey {
+        case availableCount = "available_count"
+        case credits
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let rawCount: Int?
+        if let value = try? container.decode(Int.self, forKey: .availableCount) {
+            rawCount = value
+        } else if let value = try? container.decode(Double.self, forKey: .availableCount) {
+            rawCount = SafeNumericConversions.exactInt(value)
+        } else if let value = try? container.decode(String.self, forKey: .availableCount) {
+            rawCount = Int(value)
+        } else {
+            rawCount = nil
+        }
+
+        guard let rawCount else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .availableCount,
+                in: container,
+                debugDescription: "Reset credit count is missing or invalid."
+            )
+        }
+        availableCount = try ResetCreditsNormalizer.validateAvailableCount(
+            rawCount,
+            codingPath: container.codingPath + [CodingKeys.availableCount]
+        )
+        credits = (try? container.decodeIfPresent([Credit].self, forKey: .credits)) ?? []
+    }
+
+    func summary(now: Date) -> ResetCreditsSummary {
+        ResetCreditsNormalizer.summary(
+            availableCount: availableCount,
+            details: credits.map {
+                ResetCreditDetail(status: $0.status, expiresAt: $0.expiresAt)
+            },
+            now: now
+        )
+    }
+
+    struct Credit: Decodable {
+        var status: String?
+        var expiresAt: Date?
+
+        private enum CodingKeys: String, CodingKey {
+            case status
+            case expiresAt = "expires_at"
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            status = try? container.decodeIfPresent(String.self, forKey: .status)
+            let expiration = try? container.decodeIfPresent(String.self, forKey: .expiresAt)
+            expiresAt = expiration.flatMap(Self.parseISO8601)
+        }
+
+        private static func parseISO8601(_ value: String) -> Date? {
+            let fractional = ISO8601DateFormatter()
+            fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            if let date = fractional.date(from: value) {
+                return date
+            }
+
+            let standard = ISO8601DateFormatter()
+            standard.formatOptions = [.withInternetDateTime]
+            return standard.date(from: value)
+        }
     }
 }
 
