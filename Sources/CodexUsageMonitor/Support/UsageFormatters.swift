@@ -16,24 +16,17 @@ enum UsageFormatters {
         return formatter
     }()
 
-    static let weekdayTime: DateFormatter = {
+    static let compactDeadlineDateTime: DateFormatter = {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "EEE h:mm a"
+        formatter.dateFormat = "MM-dd HH:mm"
         return formatter
     }()
 
-    static let compactDateTime: DateFormatter = {
+    static let compactDeadlineDateTimeWithYear: DateFormatter = {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "MMM d h:mm a"
-        return formatter
-    }()
-
-    static let compactDateTimeWithYear: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "MMM d yyyy h:mm a"
+        formatter.dateFormat = "yyyy-MM-dd HH:mm"
         return formatter
     }()
 
@@ -61,42 +54,29 @@ enum UsageFormatters {
 
     static func resetTime(_ date: Date?) -> String {
         guard let date else { return "--" }
-        let calendar = Calendar.current
-        if calendar.isDateInToday(date) {
-            return "Today \(time.string(from: date))"
-        }
-        if calendar.isDateInTomorrow(date) {
-            return "Tomorrow \(time.string(from: date))"
-        }
-        return dateTime.string(from: date)
+        return compactDeadlineTime(date)
     }
 
     static func weeklyResetTime(_ date: Date?) -> String {
         guard let date else { return "unavailable" }
-        return weekdayTime.string(from: date)
+        return compactDeadlineTime(date)
     }
 
     static func resetCreditCount(_ count: Int) -> String {
         count == 1 ? "1 reset" : "\(count) resets"
     }
 
-    static func compactExpiryTime(
+    static func compactDeadlineTime(
         _ date: Date,
         relativeTo now: Date = Date()
     ) -> String {
         let calendar = Calendar.current
-        if calendar.isDateInToday(date) {
-            return "today \(time.string(from: date))"
-        }
-        if calendar.isDateInTomorrow(date) {
-            return "tomorrow \(time.string(from: date))"
-        }
         if calendar.component(.year, from: date)
-            == calendar.component(.year, from: now)
+            != calendar.component(.year, from: now)
         {
-            return compactDateTime.string(from: date)
+            return compactDeadlineDateTimeWithYear.string(from: date)
         }
-        return compactDateTimeWithYear.string(from: date)
+        return compactDeadlineDateTime.string(from: date)
     }
 
     static func isImminentExpiry(

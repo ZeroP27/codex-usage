@@ -145,6 +145,7 @@ private enum MenuLayout {
     static let summaryPanelWidth: CGFloat = 352
     static let accountsPanelWidth: CGFloat = 400
     static let accountRowMinHeight: CGFloat = 88
+    static let accountResetMetadataWidth: CGFloat = 176
     static let visibleAccountRows = 5
 
     static var accountsListMaxHeight: CGFloat {
@@ -385,15 +386,12 @@ private struct AccountMenuRow: View {
                 .help("Refresh this account quota")
             }
 
-            HStack(spacing: 10) {
+            AccountQuotaColumns {
                 AccountQuotaMetric(
                     title: "5H",
                     window: row.snapshot.sessionWindow
                 )
-
-                Divider()
-                    .frame(height: 14)
-
+            } trailing: {
                 AccountQuotaMetric(
                     title: "Weekly",
                     window: row.snapshot.weeklyWindow
@@ -409,19 +407,23 @@ private struct AccountMenuRow: View {
                     .help(error)
                     .padding(.leading, 28)
             } else {
-                HStack(spacing: 6) {
-                    Label(
-                        "Wk resets \(UsageFormatters.weeklyResetTime(row.snapshot.weeklyWindow?.resetsAt))",
-                        systemImage: "calendar"
-                    )
-                    .lineLimit(1)
-                    .layoutPriority(1)
-
-                    Spacer(minLength: 6)
+                HStack(spacing: 0) {
+                    AccountMetadataLabel(systemImage: "calendar") {
+                        Text(
+                            "Weekly · \(UsageFormatters.weeklyResetTime(row.snapshot.weeklyWindow?.resetsAt))"
+                        )
+                        .lineLimit(1)
+                        .monospacedDigit()
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
 
                     ResetCreditsDisclosure(
                         summary: row.snapshot.resetCredits,
                         style: .account
+                    )
+                    .frame(
+                        width: MenuLayout.accountResetMetadataWidth,
+                        alignment: .leading
                     )
                 }
                 .font(.caption2)
@@ -448,6 +450,55 @@ private struct AccountMenuRow: View {
 
     private var switchColor: Color {
         row.isActive ? .accentColor : .secondary
+    }
+}
+
+private struct AccountQuotaColumns<Leading: View, Trailing: View>: View {
+    var leading: Leading
+    var trailing: Trailing
+
+    init(
+        @ViewBuilder leading: () -> Leading,
+        @ViewBuilder trailing: () -> Trailing
+    ) {
+        self.leading = leading()
+        self.trailing = trailing()
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            leading
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            Divider()
+                .frame(width: 1, height: 14)
+
+            trailing
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+}
+
+private struct AccountMetadataLabel<Content: View>: View {
+    var systemImage: String
+    var content: Content
+
+    init(
+        systemImage: String,
+        @ViewBuilder content: () -> Content
+    ) {
+        self.systemImage = systemImage
+        self.content = content()
+    }
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 5) {
+            Image(systemName: systemImage)
+                .font(.caption2)
+                .frame(width: 16, height: 14)
+
+            content
+        }
     }
 }
 
@@ -536,23 +587,32 @@ private struct ResetCreditsDisclosure: View {
     private var disclosureLabel: some View {
         switch style {
         case .summary:
-            HStack(spacing: 4) {
-                Text(ResetCreditsPresentation.summaryValue(summary))
-                    .lineLimit(1)
-
-                if summary?.availableCount ?? 0 > 0 {
-                    Image(systemName: "info.circle")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                }
-            }
+            summaryValueText
+                .lineLimit(1)
+                .monospacedDigit()
         case .account:
-            HStack(spacing: 4) {
-                Image(systemName: "arrow.counterclockwise")
+            AccountMetadataLabel(
+                systemImage: ResetCreditsPresentation.symbolName
+            ) {
                 accountValueText
                     .lineLimit(1)
+                    .monospacedDigit()
             }
         }
+    }
+
+    private var summaryValueText: Text {
+        let value = Text(
+            ResetCreditsPresentation.summaryValue(summary)
+        )
+        guard summary?.availableCount ?? 0 > 0 else {
+            return value
+        }
+        return value
+            + Text(" ")
+            + Text(Image(systemName: "info.circle"))
+                .font(.caption2)
+                .foregroundColor(Color.secondary.opacity(0.6))
     }
 
     private var accountValueText: Text {
@@ -574,7 +634,7 @@ private struct ResetCreditsDisclosure: View {
             summary
         ) else {
             return count
-                + Text(" · expiry unavailable")
+                + Text(" · expiration unknown")
                     .foregroundColor(.secondary)
         }
 
@@ -582,9 +642,9 @@ private struct ResetCreditsDisclosure: View {
             ? .orange
             : .secondary
         return count
-            + Text(" · exp ")
+            + Text(" · expires ")
                 .foregroundColor(.secondary)
-            + Text(UsageFormatters.compactExpiryTime(expiration))
+            + Text(UsageFormatters.compactDeadlineTime(expiration))
                 .foregroundColor(expirationColor)
     }
 }
@@ -601,7 +661,7 @@ private struct ResetCreditsDetailsPopover: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Label(
                         "Reset credits",
-                        systemImage: "arrow.counterclockwise"
+                        systemImage: ResetCreditsPresentation.symbolName
                     )
                     .font(.headline)
 
@@ -791,6 +851,7 @@ private struct MenuQuotaCard: View {
                     Text(resetText)
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
+                        .monospacedDigit()
                 }
 
                 Spacer()
@@ -816,12 +877,14 @@ private struct MenuQuotaCard: View {
 
     private var resetText: String {
         guard let window else { return "Not reported" }
-        return "Resets \(UsageFormatters.resetTime(window.resetsAt))"
+        return "Reset \(UsageFormatters.resetTime(window.resetsAt))"
     }
 }
 
 @MainActor
 private enum ResetCreditsPresentation {
+    static let symbolName = "ticket"
+
     static func nearestFutureExpiration(
         _ summary: ResetCreditsSummary,
         now: Date = Date()
@@ -836,11 +899,15 @@ private enum ResetCreditsPresentation {
         guard let summary else { return "Unavailable" }
         guard summary.availableCount > 0 else { return "None" }
 
-        let count = "\(summary.availableCount)"
+        let count = UsageFormatters.resetCreditCount(summary.availableCount)
         guard let expiration = nearestFutureExpiration(summary, now: now) else {
-            return "\(count) · expiry unavailable"
+            return "\(count) · expiration unknown"
         }
-        return "\(count) · \(UsageFormatters.compactExpiryTime(expiration, relativeTo: now))"
+        let deadline = UsageFormatters.compactDeadlineTime(
+            expiration,
+            relativeTo: now
+        )
+        return "\(count) · expires \(deadline)"
     }
 
     static func helpText(
@@ -890,19 +957,12 @@ private struct ResetCreditsSummaryInfoRow: View {
     var summary: ResetCreditsSummary?
 
     var body: some View {
-        HStack {
-            Text("Reset credits")
-                .foregroundStyle(.secondary)
-
-            Spacer()
-
+        CompactInfoRowLayout(title: "Reset credits") {
             ResetCreditsDisclosure(
                 summary: summary,
                 style: .summary
             )
         }
-        .font(.caption)
-        .padding(.horizontal, 2)
     }
 }
 
@@ -912,16 +972,37 @@ private struct CompactInfoRow: View {
     var helpText: String? = nil
 
     var body: some View {
-        HStack {
-            Text(title)
-                .foregroundStyle(.secondary)
-            Spacer()
+        CompactInfoRowLayout(title: title) {
             Text(value)
                 .lineLimit(1)
         }
+        .help(helpText ?? "\(title): \(value)")
+    }
+}
+
+private struct CompactInfoRowLayout<Trailing: View>: View {
+    var title: String
+    var trailing: Trailing
+
+    init(
+        title: String,
+        @ViewBuilder trailing: () -> Trailing
+    ) {
+        self.title = title
+        self.trailing = trailing()
+    }
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(title)
+                .foregroundStyle(.secondary)
+
+            Spacer()
+
+            trailing
+        }
         .font(.caption)
         .padding(.horizontal, 2)
-        .help(helpText ?? "\(title): \(value)")
     }
 }
 
