@@ -42,8 +42,7 @@ struct CodexUsageStoreTests {
         )
 
         store.refreshCurrentAccount()
-        let currentLoadStarted = await waitUntilGateIsWaiting(gate)
-        #expect(currentLoadStarted)
+        await gate.waitUntilEntered()
 
         store.updateCodexExecutablePath("/new/codex")
         store.refreshCurrentAccount()
@@ -272,7 +271,7 @@ struct CodexUsageStoreTests {
         )
 
         store.refresh()
-        #expect(await waitUntilGateIsWaiting(gate))
+        await gate.waitUntilEntered()
         try store.applyImportedConfiguration(
             .defaults,
             accountsSnapshot: CodexManagedAccountsSnapshot(
@@ -380,7 +379,7 @@ struct CodexUsageStoreTests {
         )
 
         store.refresh()
-        #expect(await waitUntilGateIsWaiting(gate))
+        await gate.waitUntilEntered()
         #expect(!store.beginConfigurationTransfer())
         await gate.open()
         #expect(await waitUntilIdle(store))
@@ -538,20 +537,33 @@ private actor StoreOperationCounter {
 }
 
 private actor StoreOperationGate {
-    private var continuation: CheckedContinuation<Void, Never>?
-    private(set) var isWaiting = false
+    private var openContinuation: CheckedContinuation<Void, Never>?
+    private var enteredContinuations: [CheckedContinuation<Void, Never>] = []
+    private var hasEntered = false
 
     func wait() async {
-        isWaiting = true
+        hasEntered = true
+        enteredContinuations.forEach { $0.resume() }
+        enteredContinuations.removeAll()
+
         await withCheckedContinuation { continuation in
-            self.continuation = continuation
+            openContinuation = continuation
         }
-        isWaiting = false
     }
 
     func open() {
-        continuation?.resume()
-        continuation = nil
+        openContinuation?.resume()
+        openContinuation = nil
+    }
+
+    func waitUntilEntered() async {
+        guard !hasEntered else {
+            return
+        }
+
+        await withCheckedContinuation { continuation in
+            enteredContinuations.append(continuation)
+        }
     }
 }
 
@@ -684,14 +696,4 @@ private func waitUntilAccountRemovalFinishes(_ store: CodexUsageStore) async -> 
         await Task.yield()
     }
     return !store.isRemovingAccount
-}
-
-private func waitUntilGateIsWaiting(_ gate: StoreOperationGate) async -> Bool {
-    for _ in 0..<1_000 {
-        if await gate.isWaiting {
-            return true
-        }
-        await Task.yield()
-    }
-    return await gate.isWaiting
 }
